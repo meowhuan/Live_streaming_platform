@@ -1,0 +1,1440 @@
+<script setup>
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
+
+const isNight = ref(false);
+const loading = ref(true);
+const error = ref("");
+const wsStatus = ref("disconnected");
+const wsError = ref("");
+const lastUpdated = ref("");
+const showKey = ref(false);
+const copyNotice = ref("");
+const autoRefresh = ref(true);
+const eventLog = ref([]);
+const history = ref({
+  viewers: [],
+  bitrate: [],
+  latency: []
+});
+const adminToken = ref(localStorage.getItem("live_admin_token") || "");
+const adminUser = ref("");
+const adminPass = ref("");
+const adminIdentity = ref(localStorage.getItem("live_admin_identity") || "");
+const adminSaving = ref(false);
+const actionNotice = ref("");
+const isAuthed = computed(() => !!adminToken.value);
+const smtpConfig = ref({
+  host: "",
+  port: 587,
+  username: "",
+  password: "",
+  from: "",
+  replyTo: "",
+  starttls: true,
+  passwordSet: false
+});
+const smtpSaving = ref(false);
+const smtpNotice = ref("");
+const smtpTestTo = ref("");
+const smtpTestSending = ref(false);
+const adminTurnstileToken = ref("");
+const adminTurnstileRef = ref(null);
+let adminTurnstileId = null;
+let adminTurnstileScriptLoading = false;
+const form = ref({
+  roomId: "",
+  title: "",
+  host: "",
+  resolution: "",
+  bitrate: "",
+  latency: ""
+});
+
+const stream = ref({
+  roomId: "-",
+  title: "-",
+  host: "-",
+  resolution: "-",
+  status: "offline",
+  bitrate: "-",
+  latency: "-",
+  pushLatency: "-",
+  playoutDelay: "-",
+  chatRate: "-",
+  giftResponse: "-",
+  giftLatency: "-",
+  viewers: 0,
+  updatedAt: ""
+});
+
+const streamStats = ref([]);
+const healthChecks = ref([]);
+const scheduleList = ref([]);
+const channelCards = ref([]);
+const opsAlerts = ref([]);
+const ingestNodes = ref([]);
+const ingestConfig = ref([]);
+const ingestInfo = ref({ srt: "", token: "" });
+const playInfo = ref({ whep: "", hls: "" });
+const ingestDisplay = ref([]);
+const metricsInfo = ref({});
+
+
+const toggleTheme = () => {
+  isNight.value = !isNight.value;
+};
+
+const fetchJson = async (url) => {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`请求失败: ${res.status}`);
+  }
+  return res.json();
+};
+
+const clearAdminSession = (notice) => {
+  adminToken.value = "";
+  localStorage.removeItem("live_admin_token");
+  adminIdentity.value = "";
+  localStorage.removeItem("live_admin_identity");
+  if (ws) {
+    ws.close();
+    ws = null;
+  }
+  wsStatus.value = "disconnected";
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+  if (notice) {
+    actionNotice.value = notice;
+    setTimeout(() => {
+      actionNotice.value = "";
+    }, 2000);
+  }
+};
+
+const loadAll = async () => {
+  loading.value = true;
+  error.value = "";
+  try {
+    const [
+      streamRes,
+      statsRes,
+      healthRes,
+      ingestRes,
+      scheduleRes,
+      channelsRes,
+      alertsRes,
+      nodesRes,
+      ingestInfoRes,
+      playInfoRes,
+      metricsRes
+    ] = await Promise.all([
+      fetchJson("/api/stream"),
+      fetchJson("/api/stream/stats"),
+      fetchJson("/api/stream/health"),
+      fetchJson("/api/ingest/config"),
+      fetchJson("/api/schedule"),
+      fetchJson("/api/channels"),
+      fetchJson("/api/ops/alerts"),
+      fetchJson("/api/ingest/nodes"),
+      fetchJson("/api/stream/ingest"),
+      fetchJson("/api/stream/play"),
+      fetchJson("/api/mediamtx/metrics")
+    ]);
+
+    stream.value = streamRes;
+    streamStats.value = statsRes.items || [];
+    healthChecks.value = healthRes.items || [];
+    ingestConfig.value = ingestRes.items || [];
+    scheduleList.value = scheduleRes.items || [];
+    channelCards.value = channelsRes.items || [];
+    opsAlerts.value = alertsRes.items || [];
+    ingestNodes.value = nodesRes.items || [];
+    ingestInfo.value = ingestInfoRes || { srt: "", token: "" };
+    playInfo.value = playInfoRes || { whep: "", hls: "" };
+    metricsInfo.value = metricsRes.items || {};
+    ingestDisplay.value = [
+      ...(ingestInfo.value.srt
+        ? [{
+            protocol: "SRT",
+            url: ingestInfo.value.srt,
+            note: "后端签发推流地址",
+            tag: "推流"
+          }]
+        : []),
+      ...(playInfo.value.whep
+        ? [{
+            protocol: "WHEP",
+            url: playInfo.value.whep,
+            note: "观众端 WebRTC",
+            tag: "播放"
+          }]
+        : []),
+      ...(playInfo.value.hls
+        ? [{
+            protocol: "HLS",
+            url: playInfo.value.hls,
+            note: "观众端 HLS",
+            tag: "播放"
+          }]
+        : [])
+    ];
+    lastUpdated.value = new Date().toLocaleTimeString("zh-CN");
+    form.value = {
+      roomId: streamRes.roomId || "",
+      title: streamRes.title || "",
+      host: streamRes.host || "",
+      resolution: streamRes.resolution || "",
+      bitrate: streamRes.bitrate || "",
+      latency: streamRes.latency || ""
+    };
+    pushHistory(stream.value);
+    pushEvent("数据刷新", "已从 API 拉取最新数据");
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : "加载失败";
+    pushEvent("数据刷新", "拉取失败");
+  } finally {
+    loading.value = false;
+  }
+};
+
+const applySnapshot = (snapshot) => {
+  if (!snapshot) return;
+  if (snapshot.stream) stream.value = snapshot.stream;
+  if (snapshot.stats) streamStats.value = snapshot.stats;
+  if (snapshot.health) healthChecks.value = snapshot.health;
+  if (snapshot.ingestConfig) ingestConfig.value = snapshot.ingestConfig;
+  if (snapshot.schedule) scheduleList.value = snapshot.schedule;
+  if (snapshot.channels) channelCards.value = snapshot.channels;
+  if (snapshot.opsAlerts) opsAlerts.value = snapshot.opsAlerts;
+  if (snapshot.nodes) ingestNodes.value = snapshot.nodes;
+  if (snapshot.stream) pushHistory(snapshot.stream);
+};
+
+const applyUpdate = (type, data) => {
+  switch (type) {
+    case "stream:update":
+      stream.value = data;
+      lastUpdated.value = data?.updatedAt
+        ? new Date(data.updatedAt).toLocaleTimeString("zh-CN")
+        : new Date().toLocaleTimeString("zh-CN");
+      pushHistory(data);
+      pushEvent("推流更新", `状态 ${data?.status || "-"}`);
+      break;
+    case "stats:update":
+      streamStats.value = data;
+      pushEvent("统计更新", "控制台指标已更新");
+      break;
+    case "health:update":
+      healthChecks.value = data;
+      pushEvent("健康度", "推流健康度更新");
+      break;
+    case "ingest:update":
+      ingestConfig.value = data;
+      pushEvent("配置更新", "推流配置变更");
+      break;
+    case "schedule:update":
+      scheduleList.value = data;
+      pushEvent("排期更新", "排期已同步");
+      break;
+    case "channels:update":
+      channelCards.value = data;
+      pushEvent("频道更新", "频道列表已更新");
+      break;
+    case "ops:update":
+      opsAlerts.value = data;
+      pushEvent("运营提醒", "提醒内容更新");
+      break;
+    case "nodes:update":
+      ingestNodes.value = data;
+      pushEvent("节点更新", "推荐节点更新");
+      break;
+    default:
+      break;
+  }
+};
+
+const pushEvent = (title, detail) => {
+  const entry = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    title,
+    detail,
+    time: new Date().toLocaleTimeString("zh-CN")
+  };
+  eventLog.value = [entry, ...eventLog.value].slice(0, 12);
+};
+
+const clearEvents = () => {
+  eventLog.value = [];
+};
+
+const parseNumber = (value) => {
+  if (typeof value === "number") return value;
+  if (!value) return null;
+  const parsed = Number.parseFloat(String(value).replace(/[^0-9.]+/g, ""));
+  return Number.isNaN(parsed) ? null : parsed;
+};
+
+const parseBitrateMbps = (value) => {
+  if (!value) return null;
+  const num = parseNumber(value);
+  if (num === null) return null;
+  const lower = String(value).toLowerCase();
+  if (lower.includes("kbps")) return num / 1000;
+  return num;
+};
+
+const parseLatencyMs = (value) => {
+  if (!value) return null;
+  const num = parseNumber(value);
+  if (num === null) return null;
+  const lower = String(value).toLowerCase();
+  if (lower.includes("s") && !lower.includes("ms")) return num * 1000;
+  return num;
+};
+
+const bitrateStatus = () => {
+  const mbps = parseBitrateMbps(stream.value.bitrate);
+  if (mbps === null) return "unknown";
+  if (mbps < 4) return "bad";
+  if (mbps > 10) return "warn";
+  return "ok";
+};
+
+const latencyStatus = () => {
+  const ms = parseLatencyMs(stream.value.latency);
+  if (ms === null) return "unknown";
+  if (ms > 2500) return "bad";
+  if (ms > 600) return "warn";
+  return "ok";
+};
+
+const pushHistory = (payload) => {
+  if (!payload) return;
+  const next = { ...history.value };
+  const viewers = parseNumber(payload.viewers);
+  const bitrate = parseNumber(payload.bitrate);
+  const latency = parseNumber(payload.latency);
+
+  if (viewers !== null) next.viewers = [...next.viewers, viewers].slice(-30);
+  if (bitrate !== null) next.bitrate = [...next.bitrate, bitrate].slice(-30);
+  if (latency !== null) next.latency = [...next.latency, latency].slice(-30);
+
+  history.value = next;
+};
+
+const sparklinePoints = (values) => {
+  if (!values || values.length < 2) return "";
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const range = max - min || 1;
+  return values
+    .map((value, index) => {
+      const x = (index / (values.length - 1)) * 100;
+      const y = 100 - ((value - min) / range) * 100;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+};
+
+const trendValue = (values) => {
+  if (!values || values.length < 2) return { diff: 0, up: true };
+  const diff = values[values.length - 1] - values[0];
+  return { diff, up: diff >= 0 };
+};
+
+const formatTime = (value) => {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleTimeString("zh-CN");
+};
+
+const isKeyItem = (item) => item?.label === "Key";
+
+const getDisplayValue = (item) => {
+  const raw = item?.url || item?.value || "-";
+  if (!isKeyItem(item)) return raw;
+  return showKey.value ? raw : "••••••••••••";
+};
+
+const copyText = async (text) => {
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    copyNotice.value = "已复制";
+  } catch {
+    copyNotice.value = "复制失败";
+  } finally {
+    setTimeout(() => {
+      copyNotice.value = "";
+    }, 1600);
+  }
+};
+
+const wsUrl = () => {
+  const envUrl = import.meta.env.VITE_WS_URL;
+  if (envUrl) return envUrl;
+  if (import.meta.env.DEV) return "ws://localhost:5174/ws";
+  const proto = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${window.location.host}/ws`;
+};
+
+let ws = null;
+let reconnectTimer = null;
+
+const adminFetch = async (url, payload) => {
+  if (!adminToken.value) {
+    actionNotice.value = "请先登录管理员";
+    return false;
+  }
+  adminSaving.value = true;
+  actionNotice.value = "";
+  try {
+    const hasBody = payload !== undefined && payload !== null;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        ...(hasBody ? { "Content-Type": "application/json" } : {}),
+        authorization: `Bearer ${adminToken.value}`
+      },
+      body: hasBody ? JSON.stringify(payload) : undefined
+    });
+      if (res.status === 401) {
+      clearAdminSession("登录已失效，请重新登录");
+      return false;
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || `请求失败 ${res.status}`);
+    }
+    actionNotice.value = "操作成功";
+    loadAll();
+    return true;
+  } catch (err) {
+    actionNotice.value = err instanceof Error ? err.message : "操作失败";
+    return false;
+  } finally {
+    adminSaving.value = false;
+    setTimeout(() => {
+      actionNotice.value = "";
+    }, 2000);
+  }
+};
+
+const loginAdmin = async () => {
+  if (!adminTurnstileToken.value) {
+    actionNotice.value = "请完成人机验证";
+    return;
+  }
+  if (!adminUser.value || !adminPass.value) {
+    actionNotice.value = "请输入账号与密码";
+    return;
+  }
+  adminSaving.value = true;
+  actionNotice.value = "";
+  try {
+    const res = await fetch("/api/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: adminUser.value,
+        password: adminPass.value,
+        turnstileToken: adminTurnstileToken.value
+      })
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || "登录失败");
+    }
+    const data = await res.json();
+    adminToken.value = data.token;
+    localStorage.setItem("live_admin_token", data.token);
+    adminIdentity.value = adminUser.value.trim();
+    localStorage.setItem("live_admin_identity", adminIdentity.value);
+    adminPass.value = "";
+    actionNotice.value = "已登录";
+    enterAdmin();
+    adminTurnstileToken.value = "";
+    if (window.turnstile) window.turnstile.reset();
+  } catch (err) {
+    actionNotice.value = err instanceof Error ? err.message : "登录失败";
+  } finally {
+    if (window.turnstile) window.turnstile.reset();
+    adminSaving.value = false;
+    setTimeout(() => {
+      actionNotice.value = "";
+    }, 2000);
+  }
+};
+
+const logoutAdmin = () => {
+  clearAdminSession("已退出");
+};
+
+const loadSmtp = async () => {
+  if (!adminToken.value) return;
+  try {
+    const res = await fetch("/api/admin/smtp", {
+      headers: { authorization: `Bearer ${adminToken.value}` }
+    });
+    if (res.status === 401) {
+      clearAdminSession("登录已失效，请重新登录");
+      return;
+    }
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data?.data) {
+      smtpConfig.value = {
+        host: data.data.host || "",
+        port: data.data.port || 587,
+        username: data.data.username || "",
+        password: "",
+        from: data.data.from || "",
+        replyTo: data.data.reply_to || "",
+        starttls: data.data.starttls ?? true,
+        passwordSet: !!data.data.password_set
+      };
+    }
+  } catch {
+    // ignore
+  }
+};
+
+const saveSmtp = async () => {
+  if (!adminToken.value) return;
+  smtpSaving.value = true;
+  smtpNotice.value = "";
+  try {
+    const payload = {
+      host: smtpConfig.value.host,
+      port: Number(smtpConfig.value.port) || 587,
+      username: smtpConfig.value.username,
+      password: smtpConfig.value.password,
+      from: smtpConfig.value.from,
+      reply_to: smtpConfig.value.replyTo || null,
+      starttls: smtpConfig.value.starttls
+    };
+    const res = await fetch("/api/admin/smtp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: `Bearer ${adminToken.value}`
+      },
+      body: JSON.stringify(payload)
+    });
+    if (res.status === 401) {
+      clearAdminSession("登录已失效，请重新登录");
+      return;
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || "保存失败");
+    }
+    smtpConfig.value.password = "";
+    smtpConfig.value.passwordSet = true;
+    smtpNotice.value = "SMTP 已保存";
+  } catch (err) {
+    smtpNotice.value = err instanceof Error ? err.message : "保存失败";
+  } finally {
+    smtpSaving.value = false;
+    setTimeout(() => {
+      smtpNotice.value = "";
+    }, 2000);
+  }
+};
+
+const sendSmtpTest = async () => {
+  if (!smtpTestTo.value.trim()) {
+    smtpNotice.value = "请输入测试邮箱";
+    return;
+  }
+  smtpTestSending.value = true;
+  smtpNotice.value = "";
+  try {
+    const res = await fetch("/api/admin/smtp/test", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: `Bearer ${adminToken.value}`
+      },
+      body: JSON.stringify({ to: smtpTestTo.value.trim() })
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || "发送失败");
+    }
+    smtpNotice.value = "测试邮件已发送";
+  } catch (err) {
+    smtpNotice.value = err instanceof Error ? err.message : "发送失败";
+  } finally {
+    smtpTestSending.value = false;
+    setTimeout(() => {
+      smtpNotice.value = "";
+    }, 2000);
+  }
+};
+
+const startStream = () => adminFetch("/api/admin/stream/update", {
+  status: "live",
+  roomId: form.value.roomId,
+  title: form.value.title,
+  host: form.value.host,
+  resolution: form.value.resolution,
+  bitrate: form.value.bitrate,
+  latency: form.value.latency
+});
+
+const stopStream = () => adminFetch("/api/admin/stream/update", {
+  status: "offline"
+});
+
+const updateStreamInfo = () => adminFetch("/api/admin/stream/update", {
+  roomId: form.value.roomId,
+  title: form.value.title,
+  host: form.value.host,
+  resolution: form.value.resolution,
+  bitrate: form.value.bitrate,
+  latency: form.value.latency
+});
+
+const createRoom = async () => adminFetch("/api/admin/room/create");
+
+let refreshTimer = null;
+
+const enterAdmin = () => {
+  loadAll();
+  loadSmtp();
+  connectWs();
+  if (!refreshTimer) {
+    refreshTimer = setInterval(() => {
+      if (autoRefresh.value && wsStatus.value !== "connected") {
+        loadAll();
+      }
+    }, 20000);
+  }
+};
+
+const connectWs = () => {
+  if (ws) {
+    ws.close();
+    ws = null;
+  }
+  wsStatus.value = "connecting";
+  wsError.value = "";
+
+  ws = new WebSocket(wsUrl());
+  ws.onopen = () => {
+    wsStatus.value = "connected";
+    pushEvent("WS 连接", "实时通道已连接");
+  };
+  ws.onmessage = (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      if (payload.type === "snapshot") {
+        applySnapshot(payload.data);
+      } else if (payload.type && payload.data) {
+        applyUpdate(payload.type, payload.data);
+      }
+    } catch {
+      wsError.value = "WS 数据解析失败";
+      pushEvent("WS 解析", "消息解析失败");
+    }
+  };
+  ws.onerror = () => {
+    wsError.value = "WS 连接错误";
+    pushEvent("WS 错误", "连接出现错误");
+  };
+  ws.onclose = () => {
+    wsStatus.value = "disconnected";
+    pushEvent("WS 断开", "正在重连");
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      connectWs();
+    }, 3000);
+  };
+};
+
+onMounted(() => {
+  if (!document.getElementById("turnstile-script")) {
+    const script = document.createElement("script");
+    script.id = "turnstile-script";
+    script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+    script.async = true;
+    script.defer = true;
+    document.body.appendChild(script);
+  }
+  window.onAdminTurnstile = (token) => {
+    adminTurnstileToken.value = token;
+  };
+  watch(() => !isAuthed.value, (show) => {
+    if (show) renderAdminTurnstile();
+  }, { immediate: true });
+  if (adminToken.value) {
+    enterAdmin();
+  } else {
+    loading.value = false;
+  }
+});
+
+const renderAdminTurnstile = async () => {
+  await nextTick();
+  if (!window.turnstile) {
+    if (!adminTurnstileScriptLoading) {
+      adminTurnstileScriptLoading = true;
+      const existing = document.getElementById("turnstile-script");
+      if (!existing) {
+        const script = document.createElement("script");
+        script.id = "turnstile-script";
+        script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+        script.async = true;
+        script.defer = true;
+        script.onload = () => renderAdminTurnstile();
+        document.body.appendChild(script);
+        return;
+      }
+    }
+    return;
+  }
+  if (!window.turnstile || !adminTurnstileRef.value) return;
+  if (adminTurnstileId) {
+    window.turnstile.remove(adminTurnstileId);
+  }
+  adminTurnstileId = window.turnstile.render(adminTurnstileRef.value, {
+    sitekey: "0x4AAAAAACncUgjk6YpyY6aB",
+    callback: "onAdminTurnstile"
+  });
+};
+
+onBeforeUnmount(() => {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (refreshTimer) clearInterval(refreshTimer);
+  if (ws) ws.close();
+});
+</script>
+
+<template>
+  <div
+    class="min-h-screen font-body page-fade transition-colors duration-700 ease-in-out meow-bg"
+    :class="isNight
+      ? 'bg-gradient-to-br from-meow-night-bg via-[#201a3f] to-[#16162a] text-meow-night-ink meow-night'
+      : 'bg-gradient-to-br from-meow-bg via-[#fff6fb] to-[#f2f0ff] text-meow-ink meow-day'"
+  >
+    <div class="relative overflow-hidden">
+      <div
+        class="pointer-events-none absolute -left-32 -top-24 h-80 w-80 rounded-[45%_55%_60%_40%/50%_60%_40%_50%] blur-3xl opacity-70 animate-floaty"
+        :class="isNight
+          ? 'bg-[radial-gradient(circle_at_top,_#3a2b6f,_transparent_65%)]'
+          : 'bg-[radial-gradient(circle_at_top,_#ffd4e6,_transparent_65%)]'"
+      ></div>
+        <div
+          class="pointer-events-none absolute -right-32 top-24 h-96 w-96 rounded-[55%_45%_45%_55%/45%_55%_45%_55%] blur-3xl opacity-70 animate-floaty"
+          :class="isNight
+            ? 'bg-[radial-gradient(circle_at_top,_#1d5c7a,_transparent_65%)]'
+            : 'bg-[radial-gradient(circle_at_top,_#c8f6ed,_transparent_65%)]'"
+        ></div>
+
+        <div v-if="!isAuthed" class="auth-overlay">
+          <div class="auth-card" :class="isNight ? 'auth-card-night' : 'auth-card-day'">
+            <div class="flex items-center justify-between">
+              <div>
+                <div class="text-xs uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">Admin Access</div>
+                <div class="font-display text-2xl mt-1">进入管理后台</div>
+              </div>
+            </div>
+
+            <div class="mt-6 grid gap-4">
+              <div class="field-group">
+                <label class="field-label">管理员账号 / 邮箱</label>
+                <input v-model="adminUser" class="field-input" placeholder="admin 或 meow@example.com" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">管理员密码</label>
+                <input v-model="adminPass" class="field-input" type="password" placeholder="••••••••" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">人机验证</label>
+                <div ref="adminTurnstileRef"></div>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <button class="meow-btn-primary motion-press" type="button" :disabled="adminSaving" @click="loginAdmin">
+                  登录
+                </button>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+        <div v-if="isAuthed" class="mx-auto w-[min(1100px,92vw)] pb-20 pt-8 relative">
+        <button
+          class="cord-switch cord-switch-mobile md:hidden"
+          type="button"
+          @click="toggleTheme"
+          :class="isNight ? 'cord-switch-night' : 'cord-switch-day'"
+          aria-label="切换深夜模式"
+        >
+          <span class="cord-line"></span>
+          <span class="cord-knob">{{ isNight ? "🌙" : "☀️" }}</span>
+          <span class="cord-label" aria-hidden="true"></span>
+        </button>
+
+        <nav class="flex items-center justify-between gap-4">
+          <div class="flex items-center gap-3">
+            <img
+              src="/logo.png"
+              alt="Meowhuan logo"
+              class="h-10 w-10 rounded-full border bg-white/70 object-cover shadow-sm"
+              :class="isNight ? 'border-meow-night-line' : 'border-meow-line'"
+            />
+            <div class="font-display text-xl tracking-wide">喵喵推流平台</div>
+          </div>
+          <div class="nav-links-wrap hidden items-center justify-end gap-5 text-sm md:flex" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+            <button
+              class="cord-switch cord-switch-desktop cord-switch-desktop-left"
+              type="button"
+              @click="toggleTheme"
+              :class="isNight ? 'cord-switch-night' : 'cord-switch-day'"
+              aria-label="切换深夜模式"
+            >
+              <span class="cord-line"></span>
+              <span class="cord-knob">{{ isNight ? "🌙" : "☀️" }}</span>
+              <span class="cord-label" aria-hidden="true"></span>
+            </button>
+            <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#dashboard">控制台</a>
+            <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#ingest">推流配置</a>
+            <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#smtp">SMTP</a>
+            <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#schedule">排期</a>
+            <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#channels">频道</a>
+            <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#ops">运营</a>
+            <button
+              class="cord-switch cord-switch-desktop cord-switch-desktop-right"
+              type="button"
+              @click="toggleTheme"
+              :class="isNight ? 'cord-switch-night' : 'cord-switch-day'"
+              aria-label="切换深夜模式"
+            >
+              <span class="cord-line"></span>
+              <span class="cord-knob">{{ isNight ? "🌙" : "☀️" }}</span>
+              <span class="cord-label" aria-hidden="true"></span>
+            </button>
+          </div>
+        </nav>
+
+        <section class="mt-8">
+          <div
+            class="meow-card motion-card p-4 text-sm flex flex-wrap items-center justify-between gap-3"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="meow-pill">数据源</span>
+              <span :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                {{ loading ? "同步中" : (error ? "同步失败" : (wsStatus === 'connected' ? "实时连接" : "已连接")) }}
+              </span>
+              <span class="status-pill" :class="wsStatus === 'connected' ? 'status-live' : 'status-idle'">
+                <span class="status-dot"></span>
+                {{ wsStatus === "connected" ? "WS 在线" : "WS 重连中" }}
+              </span>
+              <span class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                上次更新 {{ lastUpdated || "-" }}
+              </span>
+            </div>
+            <button
+              class="meow-btn-ghost motion-press"
+              :class="isNight ? 'border-meow-night-line text-meow-night-ink hover:bg-meow-night-card/80' : ''"
+              @click="loadAll"
+            >
+              {{ loading ? "刷新中" : "刷新数据" }}
+            </button>
+            <span v-if="error || wsError" class="text-xs text-[#e06b8b]">{{ error || wsError }}</span>
+          </div>
+        </section>
+
+        <section class="mt-5">
+          <div
+            class="meow-card motion-card p-4"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex items-center justify-between">
+              <div class="font-display text-base">连接设置</div>
+              <span class="meow-pill">实时</span>
+            </div>
+            <div class="mt-3 space-y-3 text-sm">
+              <div class="flex items-center justify-between gap-3">
+                <span>自动刷新（断线时）</span>
+                <button
+                  class="toggle-btn"
+                  type="button"
+                  :class="autoRefresh ? 'toggle-on' : 'toggle-off'"
+                  @click="autoRefresh = !autoRefresh"
+                  aria-label="切换自动刷新"
+                >
+                  <span class="toggle-knob"></span>
+                </button>
+              </div>
+              <div class="flex items-center justify-between gap-3">
+                <span>最近更新</span>
+                <span class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  {{ lastUpdated || "-" }}
+                </span>
+              </div>
+              <div class="flex items-center justify-between gap-3">
+                <span>WebSocket</span>
+                <span class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  {{ wsStatus === "connected" ? "在线" : "重连中" }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="mt-6 grid gap-6 md:grid-cols-[1.1fr_0.9fr]">
+          <div class="space-y-5">
+            <span class="meow-pill">🎥 Live Studio</span>
+            <h1 class="font-display text-4xl leading-tight sm:text-5xl">
+              柔软、稳定的直播推流控制台。
+            </h1>
+            <p class="text-base leading-relaxed" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+              一个专注直播推流体验的面板：让主播能随时掌握链路状态、房间节奏、互动热度，
+              并快速切换场景与节点，保持稳定、舒服的直播节奏。
+            </p>
+            <div class="flex flex-wrap gap-2">
+              <span class="meow-pill">多平台转推</span>
+              <span class="meow-pill">智能节点调度</span>
+              <span class="meow-pill">弹幕健康监控</span>
+            </div>
+          </div>
+
+          <div
+            class="meow-card motion-card p-5 grid-glass"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex items-center justify-between">
+              <div class="font-display text-lg">直播预览</div>
+              <span class="stream-chip" :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''">
+                <span class="stream-chip-dot"></span>
+                {{ stream.status === 'live' ? 'On Air' : 'Offline' }}
+              </span>
+            </div>
+            <div class="mt-4 stream-preview" :class="isNight ? 'stream-preview-night' : ''">
+              <div class="stream-preview-content">
+                <div class="flex items-center justify-between">
+                  <div class="stream-badge" :class="isNight ? 'bg-meow-night-bg text-meow-night-ink border-meow-night-line' : ''">
+                    房间 {{ stream.roomId }} · {{ stream.resolution }}
+                  </div>
+                  <div class="flex items-center gap-2 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                    <span
+                      class="status-lamp"
+                      :class="stream.status === 'live' ? 'status-live' : (stream.status === 'ready' ? 'status-warn' : 'status-idle')"
+                    ></span>
+                    {{ stream.status === 'live' ? '直播中' : (stream.status === 'ready' ? '准备中' : '离线') }}
+                  </div>
+                </div>
+                <div>
+                  <div class="text-lg font-600">{{ stream.title }}</div>
+                  <div class="mt-2 flex items-center gap-2 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                    <span class="stream-avatar"></span>
+                    {{ stream.host }}
+                  </div>
+                  <div class="mt-2 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                    观众 {{ stream.viewers }}
+                    ·
+                    <span class="metric-pill" :class="`metric-${bitrateStatus()}`">码率 {{ stream.bitrate }}</span>
+                    ·
+                    <span class="metric-pill" :class="`metric-${latencyStatus()}`">端到端 {{ stream.latency }}</span>
+                    ·
+                    <span class="metric-pill">推流延迟 {{ stream.pushLatency || "-" }}</span>
+                    ·
+                    <span class="metric-pill">播放延迟 {{ stream.playoutDelay || "-" }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="mt-4 grid gap-3 sm:grid-cols-2">
+              <div class="stat-tile" :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''">
+                <div class="text-[11px] uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  弹幕节奏
+                </div>
+                <div class="stat-value">{{ stream.chatRate }}</div>
+                <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">热度上升</div>
+              </div>
+              <div class="stat-tile" :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''">
+                <div class="text-[11px] uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  礼物响应
+                </div>
+                <div class="stat-value">{{ stream.giftResponse }}</div>
+                <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">延迟 {{ stream.giftLatency }}</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="mt-8">
+          <div
+            class="meow-card motion-card p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <h2 class="font-display text-xl">推流控制面板</h2>
+              <span class="meow-pill">本地测试</span>
+            </div>
+            <div class="mt-4 grid gap-4 md:grid-cols-[1fr_1.4fr]">
+              <div class="space-y-3">
+                <label class="field-label">管理员会话</label>
+                <div class="text-sm font-600">{{ adminIdentity || "已登录" }}</div>
+                <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  状态：{{ isAuthed ? "已登录" : "未登录" }}
+                </div>
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    class="meow-pill motion-press"
+                    type="button"
+                    :disabled="adminSaving"
+                    @click="logoutAdmin"
+                  >
+                    退出登录
+                  </button>
+                </div>
+                <div v-if="actionNotice" class="text-xs text-[#e06b8b]">{{ actionNotice }}</div>
+              </div>
+              <div class="grid gap-3 md:grid-cols-2">
+                <div class="field-group">
+                  <label class="field-label">房间号</label>
+                  <input v-model="form.roomId" class="field-input" placeholder="1024" />
+                </div>
+                <div class="field-group">
+                  <label class="field-label">频道标题</label>
+                  <input v-model="form.title" class="field-input" placeholder="夜间陪伴频道" />
+                </div>
+                <div class="field-group">
+                  <label class="field-label">主播</label>
+                  <input v-model="form.host" class="field-input" placeholder="Meowhuan" />
+                </div>
+                <div class="field-group">
+                  <label class="field-label">分辨率</label>
+                  <input v-model="form.resolution" class="field-input" placeholder="1080p" />
+                </div>
+                <div class="field-group">
+                  <label class="field-label">码率</label>
+                  <input v-model="form.bitrate" class="field-input" placeholder="4.5 Mbps" />
+                </div>
+                <div class="field-group">
+                  <label class="field-label">延迟</label>
+                  <input v-model="form.latency" class="field-input" placeholder="120ms" />
+                </div>
+              </div>
+            </div>
+            <div class="mt-4 flex flex-wrap gap-3">
+              <button
+                class="meow-btn-ghost motion-press"
+                :class="isNight ? 'border-meow-night-line text-meow-night-ink hover:bg-meow-night-card/80' : ''"
+                :disabled="adminSaving"
+                @click="createRoom"
+              >
+                创建直播间
+              </button>
+              <button
+                class="meow-btn-primary motion-press"
+                :class="isNight ? 'bg-meow-night-accent text-meow-night-bg' : ''"
+                :disabled="adminSaving"
+                @click="updateStreamInfo"
+              >
+                更新房间信息
+              </button>
+              <button
+                class="meow-btn-ghost motion-press"
+                :class="isNight ? 'border-meow-night-line text-meow-night-ink hover:bg-meow-night-card/80' : ''"
+                :disabled="adminSaving"
+                @click="startStream"
+              >
+                立即开播
+              </button>
+              <button
+                class="meow-btn-ghost motion-press"
+                :class="isNight ? 'border-meow-night-line text-meow-night-ink hover:bg-meow-night-card/80' : ''"
+                :disabled="adminSaving"
+                @click="stopStream"
+              >
+                结束推流
+              </button>
+            </div>
+            <div class="mt-5">
+              <div class="text-[11px] uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">MediaMTX 指标</div>
+              <div class="mt-2 grid gap-2 md:grid-cols-2">
+                <div
+                  v-for="(value, key) in metricsInfo"
+                  :key="key"
+                  class="stat-tile"
+                  :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''"
+                >
+                  <div class="text-xs break-all">{{ key }}</div>
+                  <div class="text-sm font-600">{{ value }}</div>
+                </div>
+                <div v-if="Object.keys(metricsInfo).length === 0" class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  暂无指标
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="dashboard" class="mt-14">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <h2 class="font-display text-2xl">直播控制台</h2>
+            <span class="meow-pill meow-pill-strong">当前链路稳定</span>
+          </div>
+          <div class="mt-4 grid gap-4 md:grid-cols-3">
+            <div class="meow-card motion-card p-4" :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''">
+              <div class="flex items-center justify-between">
+                <span class="text-xs uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">观众趋势</span>
+                <span class="trend-pill" :class="trendValue(history.viewers).up ? 'trend-up' : 'trend-down'">
+                  {{ trendValue(history.viewers).up ? "上升" : "下降" }}
+                </span>
+              </div>
+              <div class="mt-2 text-lg font-600">{{ stream.viewers }}</div>
+              <svg class="sparkline" viewBox="0 0 100 100" aria-hidden="true">
+                <polyline :points="sparklinePoints(history.viewers)" class="sparkline-line" />
+              </svg>
+            </div>
+            <div class="meow-card motion-card p-4" :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''">
+              <div class="flex items-center justify-between">
+                <span class="text-xs uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">码率趋势</span>
+                <span class="trend-pill" :class="trendValue(history.bitrate).up ? 'trend-up' : 'trend-down'">
+                  {{ trendValue(history.bitrate).up ? "上升" : "下降" }}
+                </span>
+              </div>
+              <div class="mt-2 text-lg font-600">{{ stream.bitrate }}</div>
+              <svg class="sparkline" viewBox="0 0 100 100" aria-hidden="true">
+                <polyline :points="sparklinePoints(history.bitrate)" class="sparkline-line" />
+              </svg>
+            </div>
+            <div class="meow-card motion-card p-4" :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''">
+              <div class="flex items-center justify-between">
+                <span class="text-xs uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">延迟趋势</span>
+                <span class="trend-pill" :class="trendValue(history.latency).up ? 'trend-down' : 'trend-up'">
+                  {{ trendValue(history.latency).up ? "上升" : "下降" }}
+                </span>
+              </div>
+              <div class="mt-2 text-lg font-600">{{ stream.latency }}</div>
+              <svg class="sparkline" viewBox="0 0 100 100" aria-hidden="true">
+                <polyline :points="sparklinePoints(history.latency)" class="sparkline-line" />
+              </svg>
+            </div>
+          </div>
+          <div class="mt-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <div
+              v-for="stat in streamStats"
+              :key="stat.label"
+              class="stat-tile motion-card"
+              :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''"
+            >
+              <div class="text-[11px] uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                {{ stat.label }}
+              </div>
+              <div class="stat-value">{{ stat.value }}</div>
+              <div
+                class="text-xs"
+                :class="[
+                  isNight ? 'text-meow-night-soft' : 'text-meow-soft',
+                  stat.tone === 'warn' ? 'text-[#e06b8b]' : ''
+                ]"
+              >
+                {{ stat.note }}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="ingest" class="mt-14 grid gap-6 md:grid-cols-[1.1fr_0.9fr]">
+          <div
+            class="meow-window meow-card motion-card p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line text-meow-night-soft' : 'text-meow-soft'"
+          >
+            <div class="meow-window-bar">
+              <span class="meow-window-dots"></span>
+              <span class="meow-window-title">推流配置</span>
+              <button
+                class="meow-pill motion-press px-2 py-0.5 text-[11px]"
+                type="button"
+                :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''"
+                @click="loadAll"
+              >
+                刷新地址
+              </button>
+            </div>
+            <div class="meow-window-body">
+              <div class="mt-3 space-y-3">
+                <div v-for="item in ingestDisplay" :key="item.url || item.value" class="meow-window-item">
+                  <div class="meow-window-time">{{ item.protocol || item.label }}</div>
+                  <div>
+                    <div class="meow-window-titleline">
+                      <span>{{ getDisplayValue(item) }}</span>
+                      <span class="meow-pill">{{ item.tag }}</span>
+                    </div>
+                    <div class="meow-window-meta">{{ item.note }}</div>
+                    <div class="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                      <button
+                        class="copy-btn"
+                        type="button"
+                        @click="copyText(item.url || item.value)"
+                      >
+                        复制
+                      </button>
+                      <button
+                        v-if="isKeyItem(item)"
+                        class="copy-btn"
+                        type="button"
+                        @click="showKey = !showKey"
+                      >
+                        {{ showKey ? "隐藏 Key" : "显示 Key" }}
+                      </button>
+                      <span v-if="copyNotice" class="text-[#e06b8b]">{{ copyNotice }}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div
+            class="meow-card motion-card p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <h3 class="font-display text-xl">推流健康度</h3>
+            <p class="mt-2 text-sm" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+              实时检测链路瓶颈，建议切换节点或调整码率。
+            </p>
+            <div class="mt-4 space-y-4">
+              <div v-for="check in healthChecks" :key="check.label" class="space-y-2">
+                <div class="flex items-center justify-between text-sm">
+                  <span>{{ check.label }}</span>
+                  <span class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">{{ check.note }}</span>
+                </div>
+                <div class="health-bar" :class="isNight ? 'bg-meow-night-line/50' : ''">
+                  <div class="health-bar-fill" :style="{ width: check.value + '%' }"></div>
+                </div>
+              </div>
+            </div>
+            <div class="stream-divider"></div>
+            <div class="grid gap-3 sm:grid-cols-2">
+              <div class="stat-tile" :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''">
+                <div class="text-[11px] uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">备用推流</div>
+                <div class="text-base font-600">待启用</div>
+                <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">建议开启双路推流</div>
+              </div>
+              <div class="stat-tile" :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''">
+                <div class="text-[11px] uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">线路自检</div>
+                <div class="text-base font-600">已完成</div>
+                <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">下次检测 20:30</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="smtp" class="mt-14">
+          <div
+            class="meow-card motion-card p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex items-center justify-between gap-4">
+              <div>
+                <h3 class="font-display text-xl">SMTP 设置</h3>
+                <p class="mt-2 text-sm" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  用于观众邮箱验证码与通知发送。
+                </p>
+              </div>
+              <button class="meow-btn-ghost motion-press" type="button" @click="loadSmtp">
+                刷新
+              </button>
+            </div>
+            <div class="mt-5 grid gap-4 md:grid-cols-2">
+              <div class="field-group">
+                <label class="field-label">SMTP Host</label>
+                <input v-model="smtpConfig.host" class="field-input" placeholder="smtp.example.com" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">SMTP Port</label>
+                <input v-model="smtpConfig.port" class="field-input" type="number" placeholder="587" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">SMTP 用户名</label>
+                <input v-model="smtpConfig.username" class="field-input" placeholder="user@example.com" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">SMTP 密码</label>
+                <input v-model="smtpConfig.password" class="field-input" type="password" :placeholder="smtpConfig.passwordSet ? '已设置，留空保持不变' : '输入密码'" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">发件人地址</label>
+                <input v-model="smtpConfig.from" class="field-input" placeholder="no-reply@example.com" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">Reply-To（可选）</label>
+                <input v-model="smtpConfig.replyTo" class="field-input" placeholder="support@example.com" />
+              </div>
+            </div>
+            <div class="mt-4 flex flex-wrap items-center gap-3">
+              <label class="meow-pill motion-press">
+                <input type="checkbox" class="mr-2" v-model="smtpConfig.starttls" />
+                启用 STARTTLS
+              </label>
+              <button class="meow-btn-primary motion-press" type="button" :disabled="smtpSaving" @click="saveSmtp">
+                保存 SMTP
+              </button>
+              <div class="flex flex-wrap items-center gap-2">
+                <input v-model="smtpTestTo" class="field-input min-w-[200px]" placeholder="测试邮箱" />
+                <button class="meow-btn-ghost motion-press" type="button" :disabled="smtpTestSending" @click="sendSmtpTest">
+                  发送测试邮件
+                </button>
+              </div>
+              <span v-if="smtpNotice" class="text-xs text-[#e06b8b]">{{ smtpNotice }}</span>
+            </div>
+          </div>
+        </section>
+
+        <section id="schedule" class="mt-14">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <h2 class="font-display text-2xl">今日直播排期</h2>
+            <span class="meow-pill">自动同步日程</span>
+          </div>
+          <div
+            class="meow-window meow-card motion-card mt-4 p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line text-meow-night-soft' : 'text-meow-soft'"
+          >
+            <div class="meow-window-body">
+              <div class="mt-2 space-y-3">
+                <div v-for="item in scheduleList" :key="item.title" class="meow-window-item">
+                  <div class="meow-window-time">{{ item.time }}</div>
+                  <div>
+                    <div class="meow-window-titleline">
+                      <span>{{ item.title }}</span>
+                      <span class="meow-pill">{{ item.tag }}</span>
+                    </div>
+                    <div class="meow-window-meta">主持：{{ item.host }}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="channels" class="mt-14">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <h2 class="font-display text-2xl">频道管理</h2>
+            <span class="meow-pill">{{ channelCards.length }} 个频道在线</span>
+          </div>
+          <div class="mt-5 grid gap-4 md:grid-cols-3">
+            <article
+              v-for="channel in channelCards"
+              :key="channel.name"
+              class="meow-card motion-card p-5"
+              :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+            >
+              <div class="flex items-center justify-between">
+                <h3 class="text-base font-600">{{ channel.name }}</h3>
+                <span class="meow-pill">{{ channel.status }}</span>
+              </div>
+              <p class="mt-3 text-sm" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                {{ channel.category }}
+              </p>
+              <div class="mt-4 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                关注数 {{ channel.followers }}
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section id="ops" class="mt-14 grid gap-6 md:grid-cols-2">
+          <div
+            class="meow-card motion-card p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex items-center justify-between">
+              <h3 class="font-display text-xl">运营提醒</h3>
+              <span class="meow-pill">实时</span>
+            </div>
+            <div class="mt-4 space-y-3">
+              <div
+                v-for="alert in opsAlerts"
+                :key="alert.title"
+                class="stat-tile"
+                :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''"
+              >
+                <div class="text-sm font-600">{{ alert.title }}</div>
+                <p class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  {{ alert.desc }}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div
+            class="meow-card motion-card p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex items-center justify-between">
+              <h3 class="font-display text-xl">推荐节点</h3>
+              <span class="meow-pill">智能调度</span>
+            </div>
+            <p class="mt-2 text-sm" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+              系统根据地区与负载推荐最优接入点。
+            </p>
+            <div class="mt-4 space-y-3">
+              <div
+                v-for="node in ingestNodes"
+                :key="node.city"
+                class="stat-tile"
+                :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''"
+              >
+                <div class="flex items-center justify-between text-sm">
+                  <span>{{ node.city }}</span>
+                  <span class="meow-pill">{{ node.load }}负载</span>
+                </div>
+                <div class="mt-1 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">延迟 {{ node.latency }}</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="mt-14">
+          <div
+            class="meow-card motion-card p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex items-center justify-between">
+              <h3 class="font-display text-xl">事件流</h3>
+              <button
+                class="meow-pill motion-press text-[11px]"
+                type="button"
+                @click="clearEvents"
+              >
+                清空
+              </button>
+            </div>
+            <div class="event-log mt-3">
+              <div v-if="eventLog.length === 0" class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                暂无事件
+              </div>
+              <div v-for="item in eventLog" :key="item.id" class="event-item">
+                <div class="event-title">{{ item.title }}</div>
+                <div class="event-detail" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  {{ item.detail }}
+                </div>
+                <div class="event-time" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  {{ item.time }}
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <footer class="mt-16 text-center text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+          © 2026 Meowhuan Live Studio. 保持稳定，保持温柔。
+        </footer>
+      </div>
+    </div>
+  </div>
+</template>
