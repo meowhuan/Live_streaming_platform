@@ -125,7 +125,7 @@ SRT_FORWARD=srt://127.0.0.1:9001?mode=caller
 
 前端使用：
 
-- Site Key: `0x4AAAAAACncUgjk6YpyY6aB`
+- Site Key: `TURNSTILE_SITE_SECRET`
 
 后端需要：
 
@@ -272,7 +272,7 @@ SRT_FORWARD=srt://127.0.0.1:9001?mode=caller
 
 The frontend uses Cloudflare Turnstile with:
 
-- Site Key: `0x4AAAAAACncUgjk6YpyY6aB`
+- Site Key: `TURNSTILE_SITE_SECRET`
 
 The backend expects:
 
