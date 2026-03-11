@@ -16,6 +16,7 @@ const stream = ref({
   latency: "-",
   pushLatency: "-",
   playoutDelay: "-",
+  fps: "-",
   chatRate: "-",
   viewers: 0,
   updatedAt: ""
@@ -135,13 +136,19 @@ const reportWhepStats = async () => {
     const stats = await pc.getStats();
     let rttMs = null;
     let playoutDelayMs = null;
+    let fps = null;
     stats.forEach((stat) => {
       if (stat.type === "candidate-pair" && stat.state === "succeeded" && stat.currentRoundTripTime) {
         rttMs = stat.currentRoundTripTime * 1000;
       }
-      if (stat.type === "inbound-rtp" && stat.kind === "video" && stat.jitterBufferEmittedCount) {
-        const delay = (stat.jitterBufferDelay / stat.jitterBufferEmittedCount) * 1000;
-        playoutDelayMs = Number.isFinite(delay) ? delay : playoutDelayMs;
+      if (stat.type === "inbound-rtp" && stat.kind === "video") {
+        if (stat.jitterBufferEmittedCount) {
+          const delay = (stat.jitterBufferDelay / stat.jitterBufferEmittedCount) * 1000;
+          playoutDelayMs = Number.isFinite(delay) ? delay : playoutDelayMs;
+        }
+        if (Number.isFinite(stat.framesPerSecond)) {
+          fps = stat.framesPerSecond;
+        }
       }
     });
     let e2eLatencyMs = null;
@@ -155,12 +162,16 @@ const reportWhepStats = async () => {
     if (playoutDelayMs !== null) {
       stream.value.playoutDelay = `${Math.round(playoutDelayMs)}ms`;
     }
+    if (fps !== null) {
+      stream.value.fps = `${Math.round(fps)} fps`;
+    }
     await fetch(apiUrl("/api/stream/telemetry"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         e2eLatencyMs,
-        playoutDelayMs
+        playoutDelayMs,
+        fps
       })
     });
   } catch {
@@ -467,9 +478,7 @@ const sendViewerCode = async () => {
     }
     viewerRegisterToken.value = "";
     viewerRegisterTokenExpiresAt.value = 0;
-    viewerNotice.value = data?.devCode
-      ? `验证码已发送（开发模式：${data.devCode}）`
-      : "验证码已发送，请查收邮箱";
+    viewerNotice.value = "验证码已发送，请查收邮箱";
   } catch (err) {
     viewerNotice.value = err instanceof Error ? err.message : "验证码发送失败";
   } finally {
@@ -921,6 +930,7 @@ watch(chatMessages, () => {
             <span class="metric-pill" :class="`metric-${latencyStatus()}`">端到端 {{ stream.latency }}</span>
             <span class="metric-pill">推流延迟 {{ stream.pushLatency || "-" }}</span>
             <span class="metric-pill">播放延迟 {{ stream.playoutDelay || "-" }}</span>
+            <span class="metric-pill">当前帧率 {{ stream.fps || "-" }}</span>
             <span class="metric-pill">弹幕节奏 {{ chatRateLocal }}</span>
             <span class="metrics-copy">© 2026 Meowhuan Live Room</span>
           </div>

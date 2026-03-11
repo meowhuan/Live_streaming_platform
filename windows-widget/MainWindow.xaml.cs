@@ -2,6 +2,7 @@ using System;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -239,6 +240,56 @@ public partial class MainWindow : Window
         ChatScroll.ScrollToEnd();
     }
 
+    private async void OnSendClick(object sender, RoutedEventArgs e)
+    {
+        await SendChatAsync();
+    }
+
+    private async void OnChatInputKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            await SendChatAsync();
+            e.Handled = true;
+        }
+    }
+
+    private async Task SendChatAsync()
+    {
+        var text = ChatInput.Text?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            NoticeText.Text = "请输入弹幕内容";
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(_config.ViewerToken))
+        {
+            NoticeText.Text = "请在 settings.json 配置 ViewerToken";
+            return;
+        }
+
+        try
+        {
+            var url = new Uri(new Uri(_config.ApiBase), "/api/chat/send");
+            var payload = JsonSerializer.Serialize(new { text });
+            using var req = new HttpRequestMessage(HttpMethod.Post, url);
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _config.ViewerToken);
+            req.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+            using var res = await _http.SendAsync(req);
+            if (!res.IsSuccessStatusCode)
+            {
+                NoticeText.Text = $"发送失败 ({(int)res.StatusCode})";
+                return;
+            }
+            ChatInput.Text = "";
+            NoticeText.Text = "已发送";
+        }
+        catch
+        {
+            NoticeText.Text = "发送失败";
+        }
+    }
+
     private static void EnableBlur(Window window)
     {
         var hwnd = new System.Windows.Interop.WindowInteropHelper(window).Handle;
@@ -295,12 +346,13 @@ public partial class MainWindow : Window
 
 public record ChatItem(string User, string Text);
 
-public record WidgetConfig(string ApiBase, string WsUrl)
+public record WidgetConfig(string ApiBase, string WsUrl, string ViewerToken)
 {
     public static WidgetConfig Load()
     {
         var envApi = Environment.GetEnvironmentVariable("MEOW_WIDGET_API_BASE");
         var envWs = Environment.GetEnvironmentVariable("MEOW_WIDGET_WS_URL");
+        var envToken = Environment.GetEnvironmentVariable("MEOW_WIDGET_VIEWER_TOKEN");
         var filePath = Path.Combine(AppContext.BaseDirectory, "settings.json");
         if (File.Exists(filePath))
         {
@@ -314,17 +366,20 @@ public record WidgetConfig(string ApiBase, string WsUrl)
                 var wsUrl = doc.RootElement.TryGetProperty("WsUrl", out var wsEl)
                     ? wsEl.GetString()
                     : null;
-                return Normalize(envApi ?? apiBase ?? "http://127.0.0.1:5174", envWs ?? wsUrl);
+                var token = doc.RootElement.TryGetProperty("ViewerToken", out var tokenEl)
+                    ? tokenEl.GetString()
+                    : null;
+                return Normalize(envApi ?? apiBase ?? "http://127.0.0.1:5174", envWs ?? wsUrl, envToken ?? token);
             }
             catch
             {
                 // ignore
             }
         }
-        return Normalize(envApi ?? "http://127.0.0.1:5174", envWs);
+        return Normalize(envApi ?? "http://127.0.0.1:5174", envWs, envToken);
     }
 
-    private static WidgetConfig Normalize(string apiBase, string? wsUrl)
+    private static WidgetConfig Normalize(string apiBase, string? wsUrl, string? viewerToken)
     {
         if (string.IsNullOrWhiteSpace(apiBase))
         {
@@ -336,6 +391,6 @@ public record WidgetConfig(string ApiBase, string WsUrl)
             var ws = apiBase.StartsWith("https", StringComparison.OrdinalIgnoreCase) ? "wss" : "ws";
             wsUrl = $"{ws}://{apiBase.Replace("http://", "").Replace("https://", "")}/ws";
         }
-        return new WidgetConfig(apiBase, wsUrl);
+        return new WidgetConfig(apiBase, wsUrl, viewerToken ?? "");
     }
 }

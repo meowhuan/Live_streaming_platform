@@ -72,6 +72,7 @@ const stream = ref({
   latency: "-",
   pushLatency: "-",
   playoutDelay: "-",
+  fps: "-",
   chatRate: "-",
   giftResponse: "-",
   giftLatency: "-",
@@ -482,6 +483,10 @@ const loginAdmin = async () => {
     localStorage.setItem("live_admin_token", data.token);
     adminIdentity.value = adminUser.value.trim();
     localStorage.setItem("live_admin_identity", adminIdentity.value);
+    if (data.viewerToken) {
+      localStorage.setItem("viewer_token", data.viewerToken);
+      localStorage.setItem("viewer_identity", data.viewerName || adminIdentity.value);
+    }
     adminPass.value = "";
     actionNotice.value = "已登录";
     enterAdmin();
@@ -555,6 +560,10 @@ const loginAdminAccess = async () => {
     localStorage.setItem("live_admin_token", data.token);
     adminIdentity.value = "Cloudflare Access";
     localStorage.setItem("live_admin_identity", adminIdentity.value);
+    if (data.viewerToken) {
+      localStorage.setItem("viewer_token", data.viewerToken);
+      localStorage.setItem("viewer_identity", data.viewerName || "主播");
+    }
     actionNotice.value = "已登录";
     enterAdmin();
     adminTurnstileToken.value = "";
@@ -735,6 +744,7 @@ const updateStreamInfo = () => adminFetch("/api/admin/stream/update", {
 });
 
 const createRoom = async () => adminFetch("/api/admin/room/create");
+const refreshIngestToken = async () => adminFetch("/api/admin/ingest/refresh");
 
 let refreshTimer = null;
 
@@ -809,6 +819,16 @@ onMounted(() => {
       .then((res) => res.ok)
       .catch(() => false);
 
+  const apiHostDiff = (() => {
+    try {
+      const base = apiBase();
+      const url = new URL(base);
+      return url.host !== window.location.host;
+    } catch {
+      return false;
+    }
+  })();
+
   Promise.all([
     fetch(apiUrl("/api/admin/access-mode"))
       .then((res) => (res.ok ? res.json() : null))
@@ -825,7 +845,11 @@ onMounted(() => {
       cfAccessEnabled.value = apiFlag;
       return;
     }
-    cfAccessEnabled.value = identityOk;
+    if (identityOk) {
+      cfAccessEnabled.value = true;
+      return;
+    }
+    cfAccessEnabled.value = apiHostDiff ? true : false;
   });
   watch(() => !isAuthed.value, (show) => {
     if (show) renderAdminTurnstile();
@@ -875,7 +899,8 @@ const renderAdminTurnstile = async () => {
   }
   if (!window.turnstile || !adminTurnstileRef.value) return;
   if (adminTurnstileId) {
-    window.turnstile.remove(adminTurnstileId);
+    window.turnstile.reset(adminTurnstileId);
+    return;
   }
   adminTurnstileId = window.turnstile.render(adminTurnstileRef.value, {
     sitekey: "0x4AAAAAACncUgjk6YpyY6aB",
@@ -1139,17 +1164,26 @@ onBeforeUnmount(() => {
                     <span class="metric-pill">推流延迟 {{ stream.pushLatency || "-" }}</span>
                     ·
                     <span class="metric-pill">播放延迟 {{ stream.playoutDelay || "-" }}</span>
+                    ·
+                    <span class="metric-pill">当前帧率 {{ stream.fps || "-" }}</span>
                   </div>
                 </div>
               </div>
             </div>
-            <div class="mt-4 grid gap-3 sm:grid-cols-2">
+            <div class="mt-4 grid gap-3 sm:grid-cols-3">
               <div class="stat-tile" :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''">
                 <div class="text-[11px] uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
                   弹幕节奏
                 </div>
                 <div class="stat-value">{{ stream.chatRate }}</div>
                 <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">热度上升</div>
+              </div>
+              <div class="stat-tile" :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''">
+                <div class="text-[11px] uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  当前帧率
+                </div>
+                <div class="stat-value">{{ stream.fps }}</div>
+                <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">播放实时统计</div>
               </div>
               <div class="stat-tile" :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''">
                 <div class="text-[11px] uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
@@ -1346,14 +1380,24 @@ onBeforeUnmount(() => {
             <div class="meow-window-bar">
               <span class="meow-window-dots"></span>
               <span class="meow-window-title">推流配置</span>
-              <button
-                class="meow-pill motion-press px-2 py-0.5 text-[11px]"
-                type="button"
-                :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''"
-                @click="loadAll"
-              >
-                刷新地址
-              </button>
+              <div class="flex items-center gap-2">
+                <button
+                  class="meow-pill motion-press px-2 py-0.5 text-[11px]"
+                  type="button"
+                  :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''"
+                  @click="refreshIngestToken"
+                >
+                  刷新推流 Key
+                </button>
+                <button
+                  class="meow-pill motion-press px-2 py-0.5 text-[11px]"
+                  type="button"
+                  :class="isNight ? 'border-meow-night-line bg-meow-night-bg text-meow-night-ink' : ''"
+                  @click="loadAll"
+                >
+                  刷新地址
+                </button>
+              </div>
             </div>
             <div class="meow-window-body">
               <div class="mt-3 space-y-3">

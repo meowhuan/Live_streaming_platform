@@ -248,6 +248,12 @@ MediaMTX 指向：
 SRT_FORWARD=srt://127.0.0.1:9001?mode=caller
 ```
 
+## 推流 Token 策略
+
+- 推流 Token 会在首次启动时生成并持久化保存（重启不会改变）。
+- 如需手动刷新推流 Key，可在管理端点击“刷新推流 Key”，或调用：
+  - `POST /api/admin/ingest/refresh`
+
 ## Turnstile
 
 前端使用：
@@ -528,6 +534,12 @@ Optional forward target:
 ```
 SRT_FORWARD=srt://127.0.0.1:9001?mode=caller
 ```
+
+## Ingest Token Strategy
+
+- The publish token is generated once and persisted (it won’t change after restarts).
+- To rotate it manually, click “刷新推流 Key” in the admin UI or call:
+  - `POST /api/admin/ingest/refresh`
 
 ## Turnstile
 

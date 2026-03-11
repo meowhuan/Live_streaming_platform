@@ -34,16 +34,19 @@ dotnet publish -c Release
 ```json
 {
   "ApiBase": "http://127.0.0.1:5174",
-  "WsUrl": ""
+  "WsUrl": "",
+  "ViewerToken": ""
 }
 ```
 
 - `ApiBase`：你的后端地址（用于拉取 `/api/chat/latest`）
 - `WsUrl`：可留空，会自动根据 ApiBase 生成 `ws(s)://.../ws`
+- `ViewerToken`：发送弹幕所需的观众 token（建议使用管理员登录同步得到的 token）
 
 环境变量优先级更高：
 - `MEOW_WIDGET_API_BASE`
 - `MEOW_WIDGET_WS_URL`
+- `MEOW_WIDGET_VIEWER_TOKEN`
 
 ## 功能
 

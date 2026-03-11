@@ -9,7 +9,7 @@ use axum::{
         ws::{Message as WsMessage, WebSocket},
         State, WebSocketUpgrade,
     },
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -144,6 +144,7 @@ struct PendingCode {
 struct ViewerSession {
     username: String,
     expires_at: Instant,
+    is_host: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -290,6 +291,7 @@ struct TelemetryPayload {
     playout_delay_ms: Option<f64>,
     #[serde(rename = "pushLatencyMs")]
     push_latency_ms: Option<f64>,
+    fps: Option<f64>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -373,13 +375,25 @@ async fn main() {
     };
 
     {
+        let publish_saved = get_json(&state.pool, "publish_token", json!(""));
+        let read_saved = get_json(&state.pool, "read_token", json!(""));
         let mut publish = state.publish_token.write().await;
-        if publish.is_empty() {
-            *publish = generate_key();
-        }
         let mut read = state.read_token.write().await;
-        if read.is_empty() {
-            *read = generate_key();
+        let publish_value = publish_saved.as_str().unwrap_or("").to_string();
+        let read_value = read_saved.as_str().unwrap_or("").to_string();
+        if publish_value.trim().is_empty() {
+            let next = generate_key();
+            *publish = next.clone();
+            set_json(&state.pool, "publish_token", &json!(next)).await;
+        } else {
+            *publish = publish_value;
+        }
+        if read_value.trim().is_empty() {
+            let next = generate_key();
+            *read = next.clone();
+            set_json(&state.pool, "read_token", &json!(next)).await;
+        } else {
+            *read = read_value;
         }
     }
 
@@ -423,6 +437,7 @@ async fn main() {
         .route("/api/admin/nodes/replace", post(admin_nodes_replace))
         .route("/api/admin/ingest/replace", post(admin_ingest_replace))
         .route("/api/admin/room/create", post(admin_room_create))
+        .route("/api/admin/ingest/refresh", post(admin_ingest_refresh))
         .route("/api/ingest/report", post(report_ingest))
         .route(&ws_path, get(ws_handler))
         .layer(CorsLayer::permissive());
@@ -574,6 +589,7 @@ fn default_kv() -> Vec<(String, Value)> {
         "latency": "2.3s",
         "pushLatency": "0.8s",
         "playoutDelay": "420ms",
+        "fps": "60 fps",
         "chatRate": "132 / min",
         "giftResponse": "98.2%",
         "giftLatency": "0.4s",
@@ -918,7 +934,7 @@ async fn get_stream_play(
 fn public_media_base(base: &str, headers: &HeaderMap) -> String {
     let (scheme, rest) = base.split_once("://").unwrap_or(("http", base));
     let (base_host_port, base_path) = rest.split_once('/').unwrap_or((rest, ""));
-    let (base_host, base_port) = split_host_port(base_host_port);
+    let (base_host, _base_port) = split_host_port(base_host_port);
     if !is_local_host(&base_host) {
         return base.to_string();
     }
@@ -1085,6 +1101,16 @@ async fn post_stream_telemetry(
     if let Some(ms) = payload.push_latency_ms {
         if let Some(obj) = patch.as_object_mut() {
             obj.insert("pushLatency".to_string(), json!(format!("{:.0}ms", ms)));
+        }
+    }
+    if let Some(fps) = payload.fps {
+        if let Some(obj) = patch.as_object_mut() {
+            let value = if fps.is_finite() && fps > 0.0 {
+                format!("{:.0} fps", fps)
+            } else {
+                "-".to_string()
+            };
+            obj.insert("fps".to_string(), json!(value));
         }
     }
     if patch.as_object().map(|obj| obj.is_empty()).unwrap_or(true) {
@@ -1308,7 +1334,13 @@ async fn admin_login(
     let mut tokens = state.tokens.write().await;
     tokens.insert(token.clone(), Instant::now() + state.token_ttl);
 
-    (StatusCode::OK, Json(json!({ "token": token, "expiresIn": state.token_ttl.as_secs() })))
+    let viewer_token = issue_viewer_token(&state, payload.username.trim().to_string(), true).await;
+    (StatusCode::OK, Json(json!({
+        "token": token,
+        "expiresIn": state.token_ttl.as_secs(),
+        "viewerToken": viewer_token,
+        "viewerName": payload.username.trim()
+    })))
 }
 
 async fn admin_access_mode(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1339,7 +1371,13 @@ async fn admin_turnstile_login(
     let mut tokens = state.tokens.write().await;
     tokens.insert(token.clone(), Instant::now() + state.token_ttl);
 
-    (StatusCode::OK, Json(json!({ "token": token, "expiresIn": state.token_ttl.as_secs() })))
+    let viewer_token = issue_viewer_token(&state, "主播".to_string(), true).await;
+    (StatusCode::OK, Json(json!({
+        "token": token,
+        "expiresIn": state.token_ttl.as_secs(),
+        "viewerToken": viewer_token,
+        "viewerName": "主播"
+    })))
 }
 
 async fn admin_smtp_get(
@@ -1722,15 +1760,7 @@ async fn viewer_register_verify(
     save_viewer_accounts(&state.pool, &accounts).await;
     pending.remove(&email);
 
-    let token = generate_key();
-    let mut tokens = state.viewer_tokens.write().await;
-    tokens.insert(
-        token.clone(),
-        ViewerSession {
-            username: username.to_string(),
-            expires_at: Instant::now() + state.viewer_token_ttl,
-        },
-    );
+    let token = issue_viewer_token(&state, username.to_string(), false).await;
     (StatusCode::OK, Json(json!({ "ok": true, "token": token, "username": username, "expiresIn": state.viewer_token_ttl.as_secs() })))
 }
 
@@ -1753,15 +1783,7 @@ async fn viewer_login(
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
     }
 
-    let token = generate_key();
-    let mut tokens = state.viewer_tokens.write().await;
-    tokens.insert(
-        token.clone(),
-        ViewerSession {
-            username: username.to_string(),
-            expires_at: Instant::now() + state.viewer_token_ttl,
-        },
-    );
+    let token = issue_viewer_token(&state, username.to_string(), false).await;
     (StatusCode::OK, Json(json!({ "token": token, "username": username, "expiresIn": state.viewer_token_ttl.as_secs() })))
 }
 
@@ -1983,23 +2005,8 @@ async fn admin_room_create(
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
 
-    let key = generate_key();
     let room_id = format!("{}", chrono::Utc::now().timestamp());
-    {
-        let mut publish = state.publish_token.write().await;
-        *publish = key.clone();
-    }
-    let read = generate_key();
-    {
-        let mut read_token = state.read_token.write().await;
-        *read_token = read.clone();
-    }
-
-    let srt_url = format!(
-        "srt://127.0.0.1:8890?streamid=publish:{}:token:{}",
-        state.mediamtx_path,
-        key
-    );
+    let key = ensure_stream_tokens(&state).await;
 
     let mut stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
     if let Some(obj) = stream.as_object_mut() {
@@ -2009,6 +2016,12 @@ async fn admin_room_create(
     }
     set_json(&state.pool, "stream", &stream).await;
     broadcast(&state, "stream:update", &stream);
+
+    let srt_url = format!(
+        "srt://127.0.0.1:8890?streamid=publish:{}:token:{}",
+        state.mediamtx_path,
+        key
+    );
 
     let ingest = json!([
         {
@@ -2033,7 +2046,32 @@ async fn admin_room_create(
     set_json(&state.pool, "ingest_config", &ingest).await;
     broadcast(&state, "ingest:update", &ingest);
 
+    let read = ensure_read_token(&state).await;
     (StatusCode::OK, Json(json!({ "ok": true, "roomId": room_id, "key": key, "srtUrl": srt_url, "readToken": read })))
+}
+
+async fn admin_ingest_refresh(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_admin_auth(&headers, &state).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+    }
+
+    let next = generate_key();
+    {
+        let mut publish = state.publish_token.write().await;
+        *publish = next.clone();
+    }
+    set_json(&state.pool, "publish_token", &json!(next)).await;
+
+    let srt_url = format!(
+        "srt://127.0.0.1:8890?streamid=publish:{}:token:{}",
+        state.mediamtx_path,
+        next
+    );
+
+    (StatusCode::OK, Json(json!({ "ok": true, "srt": srt_url, "token": next })))
 }
 
 async fn ws_handler(
@@ -2221,7 +2259,13 @@ async fn viewer_from_header(headers: &HeaderMap, state: &AppState) -> Option<Str
     let mut tokens = state.viewer_tokens.write().await;
     let now = Instant::now();
     tokens.retain(|_, session| session.expires_at > now);
-    tokens.get(&token).map(|session| session.username.clone())
+    tokens.get(&token).map(|session| {
+        if session.is_host {
+            format!("主播·{}", session.username)
+        } else {
+            session.username.clone()
+        }
+    })
 }
 
 async fn viewer_session_from_header(headers: &HeaderMap, state: &AppState) -> Option<(String, String)> {
@@ -2237,6 +2281,20 @@ async fn viewer_session_from_header(headers: &HeaderMap, state: &AppState) -> Op
     let now = Instant::now();
     tokens.retain(|_, session| session.expires_at > now);
     tokens.get(&token).map(|session| (token.clone(), session.username.clone()))
+}
+
+async fn issue_viewer_token(state: &AppState, username: String, is_host: bool) -> String {
+    let token = generate_key();
+    let mut tokens = state.viewer_tokens.write().await;
+    tokens.insert(
+        token.clone(),
+        ViewerSession {
+            username,
+            expires_at: Instant::now() + state.viewer_token_ttl,
+            is_host,
+        },
+    );
+    token
 }
 
 async fn get_admin_accounts(pool: &MySqlPool) -> Vec<AdminAccount> {
@@ -2655,6 +2713,7 @@ async fn ensure_stream_tokens(state: &Arc<AppState>) -> String {
     let token = generate_key();
     let mut publish = state.publish_token.write().await;
     *publish = token.clone();
+    set_json(&state.pool, "publish_token", &json!(token)).await;
     token
 }
 
@@ -2668,5 +2727,6 @@ async fn ensure_read_token(state: &Arc<AppState>) -> String {
     let token = generate_key();
     let mut read = state.read_token.write().await;
     *read = token.clone();
+    set_json(&state.pool, "read_token", &json!(token)).await;
     token
 }
