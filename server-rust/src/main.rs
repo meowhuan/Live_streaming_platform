@@ -1366,15 +1366,15 @@ async fn admin_viewer_anti_abuse_get(
     let cfg = resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
     (
         StatusCode::OK,
-        Json(ViewerAntiAbusePublic {
-            verify_email_rate_limit_window_secs: cfg.verify_email_rate_limit_window_secs,
-            verify_email_rate_limit_max: cfg.verify_email_rate_limit_max,
-            verify_email_rate_limit_email_max: cfg.verify_email_rate_limit_email_max,
-            verify_email_cooldown_secs: cfg.verify_email_cooldown_secs,
-            block_disposable_email: cfg.block_disposable_email,
-            block_edu_gov_email: cfg.block_edu_gov_email,
-            register_token_ttl_secs: cfg.register_token_ttl_secs,
-        }),
+        Json(json!({
+            "verify_email_rate_limit_window_secs": cfg.verify_email_rate_limit_window_secs,
+            "verify_email_rate_limit_max": cfg.verify_email_rate_limit_max,
+            "verify_email_rate_limit_email_max": cfg.verify_email_rate_limit_email_max,
+            "verify_email_cooldown_secs": cfg.verify_email_cooldown_secs,
+            "block_disposable_email": cfg.block_disposable_email,
+            "block_edu_gov_email": cfg.block_edu_gov_email,
+            "register_token_ttl_secs": cfg.register_token_ttl_secs
+        })),
     )
 }
 
@@ -1415,15 +1415,15 @@ async fn admin_viewer_anti_abuse_set(
 
     (
         StatusCode::OK,
-        Json(ViewerAntiAbusePublic {
-            verify_email_rate_limit_window_secs: cfg.verify_email_rate_limit_window_secs,
-            verify_email_rate_limit_max: cfg.verify_email_rate_limit_max,
-            verify_email_rate_limit_email_max: cfg.verify_email_rate_limit_email_max,
-            verify_email_cooldown_secs: cfg.verify_email_cooldown_secs,
-            block_disposable_email: cfg.block_disposable_email,
-            block_edu_gov_email: cfg.block_edu_gov_email,
-            register_token_ttl_secs: cfg.register_token_ttl_secs,
-        }),
+        Json(json!({
+            "verify_email_rate_limit_window_secs": cfg.verify_email_rate_limit_window_secs,
+            "verify_email_rate_limit_max": cfg.verify_email_rate_limit_max,
+            "verify_email_rate_limit_email_max": cfg.verify_email_rate_limit_email_max,
+            "verify_email_cooldown_secs": cfg.verify_email_cooldown_secs,
+            "block_disposable_email": cfg.block_disposable_email,
+            "block_edu_gov_email": cfg.block_edu_gov_email,
+            "register_token_ttl_secs": cfg.register_token_ttl_secs
+        })),
     )
 }
 
