@@ -399,6 +399,7 @@ async fn main() {
 
     let router = Router::new()
         .route("/api/stream", get(get_stream))
+        .route("/api/stream/status", get(get_stream_status))
         .route("/api/stream/stats", get(get_stats))
         .route("/api/stream/health", get(get_health))
         .route("/api/ingest/config", get(get_ingest))
@@ -881,6 +882,16 @@ async fn get_stream(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let stats = get_json(&state.pool, "stats", default_kv()[1].1.clone()).await;
     Json(json!({ "updatedAt": now_iso(), "items": stats }))
+}
+
+async fn get_stream_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
+    let status = stream
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("offline");
+    let is_live = matches!(status, "live" | "ready");
+    Json(json!({ "status": status, "live": is_live }))
 }
 
 async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
