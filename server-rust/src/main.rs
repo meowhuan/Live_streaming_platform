@@ -1421,7 +1421,7 @@ async fn admin_viewer_anti_abuse_get(
     let cfg = resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
     (
         StatusCode::OK,
-        Json(ViewerAntiAbusePublic::from(&cfg)),
+        Json(json!(ViewerAntiAbusePublic::from(&cfg))),
     )
 }
 
@@ -1462,7 +1462,7 @@ async fn admin_viewer_anti_abuse_set(
 
     (
         StatusCode::OK,
-        Json(ViewerAntiAbusePublic::from(&cfg)),
+        Json(json!(ViewerAntiAbusePublic::from(&cfg))),
     )
 }
 
