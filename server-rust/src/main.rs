@@ -375,8 +375,8 @@ async fn main() {
     };
 
     {
-        let publish_saved = get_json(&state.pool, "publish_token", json!(""));
-        let read_saved = get_json(&state.pool, "read_token", json!(""));
+        let publish_saved = get_json(&state.pool, "publish_token", json!("")).await;
+        let read_saved = get_json(&state.pool, "read_token", json!("")).await;
         let mut publish = state.publish_token.write().await;
         let mut read = state.read_token.write().await;
         let publish_value = publish_saved.as_str().unwrap_or("").to_string();
