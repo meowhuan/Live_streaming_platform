@@ -17,6 +17,7 @@ const history = ref({
   latency: []
 });
 const adminToken = ref(localStorage.getItem("live_admin_token") || "");
+const adminViewerToken = ref(localStorage.getItem("viewer_token") || "");
 const adminUser = ref("");
 const adminPass = ref("");
 const adminIdentity = ref(localStorage.getItem("live_admin_identity") || "");
@@ -83,6 +84,10 @@ const stream = ref({
 const streamStats = ref([]);
 const healthChecks = ref([]);
 const scheduleList = ref([]);
+const scheduleDraft = ref([]);
+const scheduleDirty = ref(false);
+const scheduleSaving = ref(false);
+const scheduleNotice = ref("");
 const channelCards = ref([]);
 const opsAlerts = ref([]);
 const ingestNodes = ref([]);
@@ -173,6 +178,9 @@ const loadAll = async () => {
     healthChecks.value = healthRes.items || [];
     ingestConfig.value = ingestRes.items || [];
     scheduleList.value = scheduleRes.items || [];
+    if (!scheduleDirty.value) {
+      scheduleDraft.value = normalizeSchedule(scheduleList.value);
+    }
     channelCards.value = channelsRes.items || [];
     opsAlerts.value = alertsRes.items || [];
     ingestNodes.value = nodesRes.items || [];
@@ -261,6 +269,9 @@ const applyUpdate = (type, data) => {
       break;
     case "schedule:update":
       scheduleList.value = data;
+      if (!scheduleDirty.value) {
+        scheduleDraft.value = normalizeSchedule(data);
+      }
       pushEvent("排期更新", "排期已同步");
       break;
     case "channels:update":
@@ -486,6 +497,7 @@ const loginAdmin = async () => {
     if (data.viewerToken) {
       localStorage.setItem("viewer_token", data.viewerToken);
       localStorage.setItem("viewer_identity", data.viewerName || adminIdentity.value);
+      adminViewerToken.value = data.viewerToken;
     }
     adminPass.value = "";
     actionNotice.value = "已登录";
@@ -563,6 +575,7 @@ const loginAdminAccess = async () => {
     if (data.viewerToken) {
       localStorage.setItem("viewer_token", data.viewerToken);
       localStorage.setItem("viewer_identity", data.viewerName || "主播");
+      adminViewerToken.value = data.viewerToken;
     }
     actionNotice.value = "已登录";
     enterAdmin();
@@ -910,6 +923,56 @@ const renderAdminTurnstile = async () => {
   });
 };
 
+const normalizeSchedule = (items) => {
+  if (!Array.isArray(items)) return [];
+  return items.map((item) => ({
+    time: item?.time || "",
+    title: item?.title || "",
+    tag: item?.tag || "",
+    host: item?.host || ""
+  }));
+};
+
+const addScheduleItem = () => {
+  scheduleDraft.value = [
+    ...scheduleDraft.value,
+    { time: "20:00", title: "夜猫直播间", tag: "常规", host: stream.value.host || "Meowhuan" }
+  ];
+  scheduleDirty.value = true;
+};
+
+const removeScheduleItem = (index) => {
+  scheduleDraft.value = scheduleDraft.value.filter((_, idx) => idx !== index);
+  scheduleDirty.value = true;
+};
+
+const resetScheduleDraft = () => {
+  scheduleDraft.value = normalizeSchedule(scheduleList.value);
+  scheduleDirty.value = false;
+};
+
+const saveSchedule = async () => {
+  scheduleSaving.value = true;
+  scheduleNotice.value = "";
+  const payload = scheduleDraft.value.map((item) => ({
+    time: item.time?.trim(),
+    title: item.title?.trim(),
+    tag: item.tag?.trim(),
+    host: item.host?.trim()
+  })).filter((item) => item.time || item.title);
+  const ok = await adminFetch("/api/admin/schedule/replace", payload);
+  scheduleSaving.value = false;
+  if (ok) {
+    scheduleDirty.value = false;
+    scheduleNotice.value = "已保存";
+  } else {
+    scheduleNotice.value = scheduleNotice.value || "保存失败";
+  }
+  setTimeout(() => {
+    scheduleNotice.value = "";
+  }, 2000);
+};
+
 onBeforeUnmount(() => {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   if (refreshTimer) clearInterval(refreshTimer);
@@ -1211,6 +1274,14 @@ onBeforeUnmount(() => {
                 <div class="text-sm font-600">{{ adminIdentity || "已登录" }}</div>
                 <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
                   状态：{{ isAuthed ? "已登录" : "未登录" }}
+                </div>
+                <div class="mt-2 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  ViewerToken：{{ adminViewerToken ? "已生成" : "未生成" }}
+                </div>
+                <div class="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                  <button class="copy-btn" type="button" @click="copyText(adminViewerToken)">
+                    复制 ViewerToken
+                  </button>
                 </div>
                 <div class="flex flex-wrap gap-2">
                   <button
@@ -1592,25 +1663,46 @@ onBeforeUnmount(() => {
         <section id="schedule" class="mt-14">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <h2 class="font-display text-2xl">今日直播排期</h2>
-            <span class="meow-pill">自动同步日程</span>
+            <span class="meow-pill">管理端可编辑</span>
           </div>
           <div
             class="meow-window meow-card motion-card mt-4 p-5"
             :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line text-meow-night-soft' : 'text-meow-soft'"
           >
+            <div class="meow-window-bar">
+              <span class="meow-window-dots"></span>
+              <span class="meow-window-title">排期编辑</span>
+              <div class="flex items-center gap-2">
+                <button class="meow-pill motion-press px-2 py-0.5 text-[11px]" type="button" @click="addScheduleItem">
+                  新增条目
+                </button>
+                <button class="meow-pill motion-press px-2 py-0.5 text-[11px]" type="button" :disabled="!scheduleDirty" @click="resetScheduleDraft">
+                  重置
+                </button>
+                <button class="meow-pill motion-press px-2 py-0.5 text-[11px]" type="button" :disabled="scheduleSaving" @click="saveSchedule">
+                  保存排期
+                </button>
+              </div>
+            </div>
             <div class="meow-window-body">
-              <div class="mt-2 space-y-3">
-                <div v-for="item in scheduleList" :key="item.title" class="meow-window-item">
-                  <div class="meow-window-time">{{ item.time }}</div>
-                  <div>
-                    <div class="meow-window-titleline">
-                      <span>{{ item.title }}</span>
-                      <span class="meow-pill">{{ item.tag }}</span>
+              <div class="mt-3 grid gap-3">
+                <div v-for="(item, index) in scheduleDraft" :key="`${item.time}-${index}`" class="meow-window-item">
+                  <div class="meow-window-time">
+                    <input v-model="item.time" class="field-input !h-8 !text-xs" placeholder="20:00" @input="scheduleDirty = true" />
+                  </div>
+                  <div class="w-full">
+                    <div class="grid gap-2 md:grid-cols-[1.4fr_0.6fr_0.8fr]">
+                      <input v-model="item.title" class="field-input !h-8 !text-xs" placeholder="节目标题" @input="scheduleDirty = true" />
+                      <input v-model="item.tag" class="field-input !h-8 !text-xs" placeholder="标签" @input="scheduleDirty = true" />
+                      <input v-model="item.host" class="field-input !h-8 !text-xs" placeholder="主持人" @input="scheduleDirty = true" />
                     </div>
-                    <div class="meow-window-meta">主持：{{ item.host }}</div>
+                    <div class="mt-2 flex items-center gap-2 text-[11px]">
+                      <button class="copy-btn" type="button" @click="removeScheduleItem(index)">删除</button>
+                    </div>
                   </div>
                 </div>
               </div>
+              <div class="mt-3 text-xs text-[#e06b8b]" v-if="scheduleNotice">{{ scheduleNotice }}</div>
             </div>
           </div>
         </section>

@@ -67,6 +67,9 @@ const streamUnavailable = computed(() => {
 });
 const playerStatus = ref("idle");
 const videoRef = ref(null);
+let fpsFrameCount = 0;
+let fpsWindowStart = 0;
+let fpsHandle = 0;
 const chatListRef = ref(null);
 const chatScrollRef = ref(null);
 let pc = null;
@@ -177,6 +180,26 @@ const reportWhepStats = async () => {
   } catch {
     // ignore
   }
+};
+
+const startVideoFps = () => {
+  const video = videoRef.value;
+  if (!video || typeof video.requestVideoFrameCallback !== "function") return;
+  fpsFrameCount = 0;
+  fpsWindowStart = performance.now();
+  const onFrame = () => {
+    fpsFrameCount += 1;
+    const now = performance.now();
+    const elapsed = now - fpsWindowStart;
+    if (elapsed >= 1000) {
+      const fps = (fpsFrameCount * 1000) / elapsed;
+      stream.value.fps = `${Math.round(fps)} fps`;
+      fpsFrameCount = 0;
+      fpsWindowStart = now;
+    }
+    fpsHandle = video.requestVideoFrameCallback(onFrame);
+  };
+  fpsHandle = video.requestVideoFrameCallback(onFrame);
 };
 
 const normalizeChatMessage = (item) => {
@@ -645,6 +668,7 @@ const startWhep = async (url) => {
     const stream = event.streams[0];
     if (videoRef.value && stream) {
       videoRef.value.srcObject = stream;
+      startVideoFps();
     }
   };
 
@@ -720,6 +744,7 @@ onBeforeUnmount(() => {
   if (ws) ws.close();
   if (pc) pc.close();
   if (statsTimer) clearInterval(statsTimer);
+  if (fpsHandle) cancelAnimationFrame(fpsHandle);
   if (resizeObserver) resizeObserver.disconnect();
   if (collapseMedia && collapseListener) {
     collapseMedia.removeEventListener("change", collapseListener);
@@ -788,6 +813,12 @@ watch(chatMessages, () => {
       chatHasNew.value = true;
     }
   });
+});
+
+watch(playInfo, () => {
+  if (playInfo.value?.hls && videoRef.value) {
+    startVideoFps();
+  }
 });
 </script>
 
@@ -914,7 +945,7 @@ watch(chatMessages, () => {
               <video ref="videoRef" class="viewer-video" autoplay playsinline muted controls></video>
             </template>
             <template v-else-if="playInfo.hls">
-              <video class="viewer-video" controls autoplay muted playsinline :src="playInfo.hls"></video>
+              <video ref="videoRef" class="viewer-video" controls autoplay muted playsinline :src="playInfo.hls"></video>
             </template>
             <div v-else class="viewer-screen-inner">
               <div class="viewer-screen-badge">Live</div>
