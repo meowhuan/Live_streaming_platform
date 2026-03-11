@@ -807,6 +807,13 @@ onMounted(() => {
     if (adminSaving.value) return;
     loginAdminAccess();
   });
+  watch([adminTurnstileToken, cfAccessEnabled, isAuthed], () => {
+    if (!cfAccessEnabled.value) return;
+    if (isAuthed.value) return;
+    if (!adminTurnstileToken.value) return;
+    if (adminSaving.value) return;
+    loginAdminAccess();
+  });
   if (adminToken.value) {
     enterAdmin();
   } else {
