@@ -110,6 +110,43 @@ sudo systemctl start meow-live
 sudo systemctl status meow-live
 ```
 
+### MediaMTX systemd 服务模板（Linux）
+
+假设 MediaMTX 放在 `/opt/mediamtx`，配置文件为 `/opt/mediamtx/mediamtx.yml`：
+
+```ini
+[Unit]
+Description=MediaMTX Streaming Server
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/mediamtx
+ExecStart=/opt/mediamtx/mediamtx
+Restart=on-failure
+RestartSec=3
+
+# 如需指定配置文件：
+# ExecStart=/opt/mediamtx/mediamtx /opt/mediamtx/mediamtx.yml
+
+# 安全建议
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启用方式：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable mediamtx
+sudo systemctl start mediamtx
+sudo systemctl status mediamtx
+```
+
 ## 环境变量
 
 ### 后端（Rust）
@@ -351,6 +388,43 @@ sudo systemctl daemon-reload
 sudo systemctl enable meow-live
 sudo systemctl start meow-live
 sudo systemctl status meow-live
+```
+
+### MediaMTX systemd Service Template (Linux)
+
+Assuming MediaMTX is installed at `/opt/mediamtx` and config is `/opt/mediamtx/mediamtx.yml`:
+
+```ini
+[Unit]
+Description=MediaMTX Streaming Server
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/mediamtx
+ExecStart=/opt/mediamtx/mediamtx
+Restart=on-failure
+RestartSec=3
+
+# If you want to specify the config file:
+# ExecStart=/opt/mediamtx/mediamtx /opt/mediamtx/mediamtx.yml
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable mediamtx
+sudo systemctl start mediamtx
+sudo systemctl status mediamtx
 ```
 
 ## Environment Variables

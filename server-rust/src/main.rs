@@ -194,6 +194,20 @@ struct ViewerAntiAbusePublic {
     register_token_ttl_secs: i64,
 }
 
+impl From<&ViewerAntiAbuseConfig> for ViewerAntiAbusePublic {
+    fn from(cfg: &ViewerAntiAbuseConfig) -> Self {
+        Self {
+            verify_email_rate_limit_window_secs: cfg.verify_email_rate_limit_window_secs,
+            verify_email_rate_limit_max: cfg.verify_email_rate_limit_max,
+            verify_email_rate_limit_email_max: cfg.verify_email_rate_limit_email_max,
+            verify_email_cooldown_secs: cfg.verify_email_cooldown_secs,
+            block_disposable_email: cfg.block_disposable_email,
+            block_edu_gov_email: cfg.block_edu_gov_email,
+            register_token_ttl_secs: cfg.register_token_ttl_secs,
+        }
+    }
+}
+
 struct MetricsState {
     last_rx_bytes: Option<f64>,
     last_tx_bytes: Option<f64>,
@@ -210,6 +224,7 @@ struct AuthRequest {
     query: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct CfAccessClaims {
     aud: Vec<String>,
@@ -227,6 +242,7 @@ struct CfAccessJwks {
 #[derive(Deserialize, Clone)]
 struct CfAccessJwk {
     kid: String,
+    #[allow(dead_code)]
     kty: Option<String>,
     n: String,
     e: String,
@@ -1366,15 +1382,7 @@ async fn admin_viewer_anti_abuse_get(
     let cfg = resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
     (
         StatusCode::OK,
-        Json(json!({
-            "verify_email_rate_limit_window_secs": cfg.verify_email_rate_limit_window_secs,
-            "verify_email_rate_limit_max": cfg.verify_email_rate_limit_max,
-            "verify_email_rate_limit_email_max": cfg.verify_email_rate_limit_email_max,
-            "verify_email_cooldown_secs": cfg.verify_email_cooldown_secs,
-            "block_disposable_email": cfg.block_disposable_email,
-            "block_edu_gov_email": cfg.block_edu_gov_email,
-            "register_token_ttl_secs": cfg.register_token_ttl_secs
-        })),
+        Json(ViewerAntiAbusePublic::from(&cfg)),
     )
 }
 
@@ -1415,15 +1423,7 @@ async fn admin_viewer_anti_abuse_set(
 
     (
         StatusCode::OK,
-        Json(json!({
-            "verify_email_rate_limit_window_secs": cfg.verify_email_rate_limit_window_secs,
-            "verify_email_rate_limit_max": cfg.verify_email_rate_limit_max,
-            "verify_email_rate_limit_email_max": cfg.verify_email_rate_limit_email_max,
-            "verify_email_cooldown_secs": cfg.verify_email_cooldown_secs,
-            "block_disposable_email": cfg.block_disposable_email,
-            "block_edu_gov_email": cfg.block_edu_gov_email,
-            "register_token_ttl_secs": cfg.register_token_ttl_secs
-        })),
+        Json(ViewerAntiAbusePublic::from(&cfg)),
     )
 }
 
