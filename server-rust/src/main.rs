@@ -104,6 +104,12 @@ struct RegisterTokenPayload {
 }
 
 #[derive(Deserialize)]
+struct AdminTurnstilePayload {
+    #[serde(rename = "turnstileToken")]
+    turnstile_token: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct RegisterVerifyPayload {
     email: String,
     code: String,
@@ -392,7 +398,9 @@ async fn main() {
         .route("/api/chat/send", post(post_chat_send))
         .route("/api/mediamtx/auth", post(mediamtx_auth))
         .route("/api/mediamtx/metrics", get(get_mediamtx_metrics))
+        .route("/api/admin/access-mode", get(admin_access_mode))
         .route("/api/admin/login", post(admin_login))
+        .route("/api/admin/turnstile-login", post(admin_turnstile_login))
         .route("/api/admin/smtp", get(admin_smtp_get))
         .route("/api/admin/smtp", post(admin_smtp_set))
         .route("/api/admin/smtp/test", post(admin_smtp_test))
@@ -1285,6 +1293,37 @@ async fn admin_login(
     };
     if !authed {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+    }
+
+    let token = generate_key();
+    let mut tokens = state.tokens.write().await;
+    tokens.insert(token.clone(), Instant::now() + state.token_ttl);
+
+    (StatusCode::OK, Json(json!({ "token": token, "expiresIn": state.token_ttl.as_secs() })))
+}
+
+async fn admin_access_mode(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "cf_access_enabled": cf_access_enabled(&state)
+        })),
+    )
+}
+
+async fn admin_turnstile_login(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<AdminTurnstilePayload>,
+) -> impl IntoResponse {
+    if !cf_access_enabled(&state) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "access_not_enabled" })));
+    }
+    if !verify_cf_access(&headers, &state).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "access" })));
+    }
+    if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "turnstile" })));
     }
 
     let token = generate_key();
