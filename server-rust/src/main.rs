@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{
@@ -22,6 +22,7 @@ use srt_tokio::SrtSocket;
 use sqlx::{mysql::MySqlPoolOptions, MySqlPool};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message as MailMessage,
     transport::smtp::authentication::Credentials,
@@ -56,6 +57,10 @@ struct AppState {
     smtp: RwLock<Option<SmtpConfig>>,
     metrics_state: RwLock<MetricsState>,
     turnstile_secret: Option<String>,
+    viewer_anti_abuse_defaults: ViewerAntiAbuseConfig,
+    cf_access_team_domain: Option<String>,
+    cf_access_aud: Option<String>,
+    cf_access_jwks: RwLock<Option<CfAccessJwksCache>>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +93,12 @@ struct LoginPayload {
 #[derive(Deserialize)]
 struct RegisterStartPayload {
     email: String,
+    #[serde(rename = "registerToken")]
+    register_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RegisterTokenPayload {
     #[serde(rename = "turnstileToken")]
     turnstile_token: Option<String>,
 }
@@ -150,6 +161,39 @@ struct SmtpPublic {
     password_set: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct ViewerAntiAbuseConfig {
+    verify_email_rate_limit_window_secs: i64,
+    verify_email_rate_limit_max: i64,
+    verify_email_rate_limit_email_max: i64,
+    verify_email_cooldown_secs: i64,
+    block_disposable_email: bool,
+    block_edu_gov_email: bool,
+    register_token_ttl_secs: i64,
+}
+
+#[derive(Deserialize)]
+struct ViewerAntiAbusePayload {
+    verify_email_rate_limit_window_secs: Option<i64>,
+    verify_email_rate_limit_max: Option<i64>,
+    verify_email_rate_limit_email_max: Option<i64>,
+    verify_email_cooldown_secs: Option<i64>,
+    block_disposable_email: Option<bool>,
+    block_edu_gov_email: Option<bool>,
+    register_token_ttl_secs: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct ViewerAntiAbusePublic {
+    verify_email_rate_limit_window_secs: i64,
+    verify_email_rate_limit_max: i64,
+    verify_email_rate_limit_email_max: i64,
+    verify_email_cooldown_secs: i64,
+    block_disposable_email: bool,
+    block_edu_gov_email: bool,
+    register_token_ttl_secs: i64,
+}
+
 struct MetricsState {
     last_rx_bytes: Option<f64>,
     last_tx_bytes: Option<f64>,
@@ -164,6 +208,33 @@ struct AuthRequest {
     path: Option<String>,
     token: Option<String>,
     query: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CfAccessClaims {
+    aud: Vec<String>,
+    exp: usize,
+    iat: usize,
+    sub: String,
+    email: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+struct CfAccessJwks {
+    keys: Vec<CfAccessJwk>,
+}
+
+#[derive(Deserialize, Clone)]
+struct CfAccessJwk {
+    kid: String,
+    kty: Option<String>,
+    n: String,
+    e: String,
+}
+
+struct CfAccessJwksCache {
+    fetched_at: Instant,
+    keys: Vec<CfAccessJwk>,
 }
 
 #[derive(Deserialize)]
@@ -229,7 +300,15 @@ async fn main() {
         .map(|val| val.to_lowercase() != "false")
         .unwrap_or(true);
     let turnstile_secret = std::env::var("TURNSTILE_SECRET").ok().filter(|val| !val.trim().is_empty());
+    let cf_access_team_domain = std::env::var("CF_ACCESS_TEAM_DOMAIN")
+        .ok()
+        .filter(|val| !val.trim().is_empty());
+    let cf_access_aud = std::env::var("CF_ACCESS_AUD")
+        .or_else(|_| std::env::var("CF_ACCESS_AUDIENCE"))
+        .ok()
+        .filter(|val| !val.trim().is_empty());
     let viewer_token_ttl = Duration::from_secs(env_u64("VIEWER_TOKEN_DAYS", 30) * 24 * 3600);
+    let viewer_anti_abuse_defaults = ViewerAntiAbuseConfig::from_env();
 
     let pool = create_pool().await;
     ensure_tables(&pool).await;
@@ -264,6 +343,10 @@ async fn main() {
             last_ts: Instant::now(),
         }),
         turnstile_secret,
+        viewer_anti_abuse_defaults,
+        cf_access_team_domain,
+        cf_access_aud,
+        cf_access_jwks: RwLock::new(None),
     };
 
     {
@@ -297,7 +380,10 @@ async fn main() {
         .route("/api/admin/smtp", get(admin_smtp_get))
         .route("/api/admin/smtp", post(admin_smtp_set))
         .route("/api/admin/smtp/test", post(admin_smtp_test))
+        .route("/api/admin/viewer-anti-abuse", get(admin_viewer_anti_abuse_get))
+        .route("/api/admin/viewer-anti-abuse", post(admin_viewer_anti_abuse_set))
         .route("/api/viewer/login", post(viewer_login))
+        .route("/api/viewer/register/token", post(viewer_register_token))
         .route("/api/viewer/register/start", post(viewer_register_start))
         .route("/api/viewer/register/verify", post(viewer_register_verify))
         .route("/api/viewer/me", get(viewer_me))
@@ -379,6 +465,39 @@ async fn ensure_tables(pool: &MySqlPool) {
     .execute(pool)
     .await
     .expect("create chat table failed");
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS viewer_email_log (
+          id BIGINT PRIMARY KEY AUTO_INCREMENT,
+          email VARCHAR(190) NOT NULL,
+          ip VARCHAR(64) NOT NULL,
+          created_at BIGINT NOT NULL,
+          INDEX idx_viewer_email_created (email, created_at),
+          INDEX idx_viewer_ip_created (ip, created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("create viewer_email_log failed");
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS viewer_register_tokens (
+          token VARCHAR(64) PRIMARY KEY,
+          ip VARCHAR(64) NOT NULL,
+          created_at BIGINT NOT NULL,
+          expires_at BIGINT NOT NULL,
+          used_at BIGINT NULL,
+          INDEX idx_viewer_register_ip_created (ip, created_at),
+          INDEX idx_viewer_register_expires (expires_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("create viewer_register_tokens failed");
 }
 
 async fn ensure_defaults(pool: &MySqlPool) {
@@ -525,6 +644,118 @@ fn env_u64(key: &str, fallback: u64) -> u64 {
         .ok()
         .and_then(|val| val.parse::<u64>().ok())
         .unwrap_or(fallback)
+}
+
+fn env_i64(key: &str, fallback: i64) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|val| val.parse::<i64>().ok())
+        .unwrap_or(fallback)
+}
+
+fn env_bool(key: &str, fallback: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|val| matches!(val.as_str(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(fallback)
+}
+
+impl ViewerAntiAbuseConfig {
+    fn from_env() -> Self {
+        let verify_email_rate_limit_window_secs =
+            env_i64("VIEWER_VERIFY_EMAIL_RATE_LIMIT_WINDOW_SEC", 1800).clamp(60, 86400);
+        let verify_email_rate_limit_max =
+            env_i64("VIEWER_VERIFY_EMAIL_RATE_LIMIT_MAX", 3).clamp(1, 20);
+        let verify_email_rate_limit_email_max =
+            env_i64("VIEWER_VERIFY_EMAIL_RATE_LIMIT_EMAIL_MAX", 2).clamp(1, 20);
+        let verify_email_cooldown_secs =
+            env_i64("VIEWER_VERIFY_EMAIL_COOLDOWN_SEC", 600).clamp(60, 7200);
+        let block_disposable_email = env_bool("VIEWER_BLOCK_DISPOSABLE_EMAIL", true);
+        let block_edu_gov_email = env_bool("VIEWER_BLOCK_EDU_GOV_EMAIL", true);
+        let register_token_ttl_secs =
+            env_i64("VIEWER_REGISTER_TOKEN_TTL_SEC", 600).clamp(60, 3600);
+
+        Self {
+            verify_email_rate_limit_window_secs,
+            verify_email_rate_limit_max,
+            verify_email_rate_limit_email_max,
+            verify_email_cooldown_secs,
+            block_disposable_email,
+            block_edu_gov_email,
+            register_token_ttl_secs,
+        }
+    }
+}
+
+impl Default for ViewerAntiAbusePayload {
+    fn default() -> Self {
+        Self {
+            verify_email_rate_limit_window_secs: None,
+            verify_email_rate_limit_max: None,
+            verify_email_rate_limit_email_max: None,
+            verify_email_cooldown_secs: None,
+            block_disposable_email: None,
+            block_edu_gov_email: None,
+            register_token_ttl_secs: None,
+        }
+    }
+}
+
+async fn resolve_viewer_anti_abuse_config(
+    pool: &MySqlPool,
+    defaults: &ViewerAntiAbuseConfig,
+) -> ViewerAntiAbuseConfig {
+    let raw = get_json(pool, "viewer_anti_abuse", json!({})).await;
+    let payload: ViewerAntiAbusePayload = serde_json::from_value(raw).unwrap_or_default();
+    let mut cfg = defaults.clone();
+    if let Some(value) = payload.verify_email_rate_limit_window_secs {
+        cfg.verify_email_rate_limit_window_secs = value.clamp(60, 86400);
+    }
+    if let Some(value) = payload.verify_email_rate_limit_max {
+        cfg.verify_email_rate_limit_max = value.clamp(1, 20);
+    }
+    if let Some(value) = payload.verify_email_rate_limit_email_max {
+        cfg.verify_email_rate_limit_email_max = value.clamp(1, 20);
+    }
+    if let Some(value) = payload.verify_email_cooldown_secs {
+        cfg.verify_email_cooldown_secs = value.clamp(60, 7200);
+    }
+    if let Some(value) = payload.block_disposable_email {
+        cfg.block_disposable_email = value;
+    }
+    if let Some(value) = payload.block_edu_gov_email {
+        cfg.block_edu_gov_email = value;
+    }
+    if let Some(value) = payload.register_token_ttl_secs {
+        cfg.register_token_ttl_secs = value.clamp(60, 3600);
+    }
+    cfg
+}
+
+fn now_ts() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn client_ip(headers: &HeaderMap) -> Option<String> {
+    let candidates = [
+        "cf-connecting-ip",
+        "x-forwarded-for",
+        "x-real-ip",
+    ];
+    for key in candidates {
+        if let Some(value) = headers.get(key) {
+            if let Ok(raw) = value.to_str() {
+                let ip = raw.split(',').next().unwrap_or("").trim();
+                if !ip.is_empty() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 async fn run_mediamtx_poll(
@@ -1015,8 +1246,12 @@ async fn compute_bitrate_mbps(
 
 async fn admin_login(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<LoginPayload>,
 ) -> impl IntoResponse {
+    if cf_access_enabled(&state) && !verify_cf_access(&headers, &state).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "access" })));
+    }
     if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "turnstile" })));
     }
@@ -1047,7 +1282,7 @@ async fn admin_smtp_get(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
     let data = state.smtp.read().await.clone().map(|cfg| SmtpPublic {
@@ -1067,7 +1302,7 @@ async fn admin_smtp_set(
     headers: HeaderMap,
     Json(payload): Json<SmtpConfig>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
     if payload.host.trim().is_empty()
@@ -1096,7 +1331,7 @@ async fn admin_smtp_test(
     headers: HeaderMap,
     Json(payload): Json<SmtpTestPayload>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
     let to = payload.to.trim();
@@ -1121,16 +1356,222 @@ async fn admin_smtp_test(
     (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
-async fn viewer_register_start(
+async fn admin_viewer_anti_abuse_get(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<RegisterStartPayload>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_admin_auth(&headers, &state).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" })));
+    }
+    let cfg = resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
+    (
+        StatusCode::OK,
+        Json(ViewerAntiAbusePublic {
+            verify_email_rate_limit_window_secs: cfg.verify_email_rate_limit_window_secs,
+            verify_email_rate_limit_max: cfg.verify_email_rate_limit_max,
+            verify_email_rate_limit_email_max: cfg.verify_email_rate_limit_email_max,
+            verify_email_cooldown_secs: cfg.verify_email_cooldown_secs,
+            block_disposable_email: cfg.block_disposable_email,
+            block_edu_gov_email: cfg.block_edu_gov_email,
+            register_token_ttl_secs: cfg.register_token_ttl_secs,
+        }),
+    )
+}
+
+async fn admin_viewer_anti_abuse_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ViewerAntiAbusePayload>,
+) -> impl IntoResponse {
+    if !check_admin_auth(&headers, &state).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" })));
+    }
+    let mut cfg = resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
+
+    if let Some(value) = payload.verify_email_rate_limit_window_secs {
+        cfg.verify_email_rate_limit_window_secs = value.clamp(60, 86400);
+    }
+    if let Some(value) = payload.verify_email_rate_limit_max {
+        cfg.verify_email_rate_limit_max = value.clamp(1, 20);
+    }
+    if let Some(value) = payload.verify_email_rate_limit_email_max {
+        cfg.verify_email_rate_limit_email_max = value.clamp(1, 20);
+    }
+    if let Some(value) = payload.verify_email_cooldown_secs {
+        cfg.verify_email_cooldown_secs = value.clamp(60, 7200);
+    }
+    if let Some(value) = payload.block_disposable_email {
+        cfg.block_disposable_email = value;
+    }
+    if let Some(value) = payload.block_edu_gov_email {
+        cfg.block_edu_gov_email = value;
+    }
+    if let Some(value) = payload.register_token_ttl_secs {
+        cfg.register_token_ttl_secs = value.clamp(60, 3600);
+    }
+
+    let payload = serde_json::to_value(&cfg).unwrap_or_else(|_| json!({}));
+    set_json(&state.pool, "viewer_anti_abuse", &payload).await;
+
+    (
+        StatusCode::OK,
+        Json(ViewerAntiAbusePublic {
+            verify_email_rate_limit_window_secs: cfg.verify_email_rate_limit_window_secs,
+            verify_email_rate_limit_max: cfg.verify_email_rate_limit_max,
+            verify_email_rate_limit_email_max: cfg.verify_email_rate_limit_email_max,
+            verify_email_cooldown_secs: cfg.verify_email_cooldown_secs,
+            block_disposable_email: cfg.block_disposable_email,
+            block_edu_gov_email: cfg.block_edu_gov_email,
+            register_token_ttl_secs: cfg.register_token_ttl_secs,
+        }),
+    )
+}
+
+async fn viewer_register_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<RegisterTokenPayload>,
 ) -> impl IntoResponse {
     if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "turnstile" })));
     }
+    let anti_abuse = resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
+    let now = now_ts();
+    let ip = client_ip(&headers).unwrap_or_else(|| "unknown".to_string());
+    let recent_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM viewer_register_tokens WHERE ip = ? AND created_at >= ?",
+    )
+    .bind(&ip)
+    .bind(now - anti_abuse.verify_email_rate_limit_window_secs)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    if recent_count >= anti_abuse.verify_email_rate_limit_max {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "请求过于频繁，请稍后再试" })),
+        );
+    }
+
+    let token = generate_key();
+    let expires_at = now + anti_abuse.register_token_ttl_secs;
+    let _ = sqlx::query(
+        "INSERT INTO viewer_register_tokens (token, ip, created_at, expires_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&token)
+    .bind(&ip)
+    .bind(now)
+    .bind(expires_at)
+    .execute(&state.pool)
+    .await;
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "token": token,
+            "expiresIn": anti_abuse.register_token_ttl_secs
+        })),
+    )
+}
+
+async fn viewer_register_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<RegisterStartPayload>,
+) -> impl IntoResponse {
+    let anti_abuse = resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
+    let now = now_ts();
+    let ip = client_ip(&headers).unwrap_or_else(|| "unknown".to_string());
+    let register_token = payload
+        .register_token
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if register_token.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "验证令牌缺失，请刷新后重试" })),
+        );
+    }
+    let reserved = sqlx::query(
+        "UPDATE viewer_register_tokens
+         SET used_at = ?
+         WHERE token = ? AND used_at IS NULL AND expires_at >= ? AND ip = ?",
+    )
+    .bind(now)
+    .bind(&register_token)
+    .bind(now)
+    .bind(&ip)
+    .execute(&state.pool)
+    .await
+    .map(|res| res.rows_affected())
+    .unwrap_or(0);
+    if reserved == 0 {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "验证令牌无效，请刷新后重试" })),
+        );
+    }
     let email = payload.email.trim().to_lowercase();
     if !is_valid_email(&email) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "email" })));
+    }
+    if anti_abuse.block_disposable_email && is_disposable_email_domain(&email) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "不支持一次性邮箱，请使用常用邮箱" })),
+        );
+    }
+    if anti_abuse.block_edu_gov_email && is_edu_or_gov_email_domain(&email) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "不支持 .edu/.gov 邮箱，请使用常用邮箱" })),
+        );
+    }
+
+    let recent_ip_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM viewer_email_log WHERE ip = ? AND created_at >= ?",
+    )
+    .bind(&ip)
+    .bind(now - anti_abuse.verify_email_rate_limit_window_secs)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    if recent_ip_count >= anti_abuse.verify_email_rate_limit_max {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "发送过于频繁，请稍后再试" })),
+        );
+    }
+    let recent_email_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM viewer_email_log WHERE email = ? AND created_at >= ?",
+    )
+    .bind(&email)
+    .bind(now - anti_abuse.verify_email_rate_limit_window_secs)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    if recent_email_count >= anti_abuse.verify_email_rate_limit_email_max {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "该邮箱发送次数已达上限，请稍后再试" })),
+        );
+    }
+    let last_sent: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(created_at) FROM viewer_email_log WHERE email = ?",
+    )
+    .bind(&email)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(None);
+    if let Some(last_sent) = last_sent {
+        if now.saturating_sub(last_sent) < anti_abuse.verify_email_cooldown_secs {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "发送过于频繁，请稍后再试" })),
+            );
+        }
     }
     let code = generate_code();
     let mut pending = state.pending_viewer_codes.write().await;
@@ -1151,11 +1592,34 @@ async fn viewer_register_start(
         )
         .await
         {
+            let _ = sqlx::query(
+                "UPDATE viewer_register_tokens SET used_at = NULL WHERE token = ? AND used_at = ?",
+            )
+            .bind(&register_token)
+            .bind(now)
+            .execute(&state.pool)
+            .await;
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": err })));
         }
     } else if !state.email_echo {
+        let _ = sqlx::query(
+            "UPDATE viewer_register_tokens SET used_at = NULL WHERE token = ? AND used_at = ?",
+        )
+        .bind(&register_token)
+        .bind(now)
+        .execute(&state.pool)
+        .await;
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "smtp_not_configured" })));
     }
+
+    let _ = sqlx::query(
+        "INSERT INTO viewer_email_log (email, ip, created_at) VALUES (?, ?, ?)",
+    )
+    .bind(&email)
+    .bind(&ip)
+    .bind(now)
+    .execute(&state.pool)
+    .await;
 
     let mut response = json!({
         "ok": true,
@@ -1321,7 +1785,7 @@ async fn admin_stream_update(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
     let mut base = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
@@ -1339,7 +1803,7 @@ async fn admin_stats_replace(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
     let items = unwrap_items(&payload);
@@ -1353,7 +1817,7 @@ async fn admin_health_replace(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
     let items = unwrap_items(&payload);
@@ -1367,7 +1831,7 @@ async fn admin_schedule_replace(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
     let items = unwrap_items(&payload);
@@ -1381,7 +1845,7 @@ async fn admin_channels_replace(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
     let items = unwrap_items(&payload);
@@ -1395,7 +1859,7 @@ async fn admin_ops_replace(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
     let items = unwrap_items(&payload);
@@ -1409,7 +1873,7 @@ async fn admin_nodes_replace(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
     let items = unwrap_items(&payload);
@@ -1423,7 +1887,7 @@ async fn admin_ingest_replace(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
     let items = unwrap_items(&payload);
@@ -1437,7 +1901,7 @@ async fn report_ingest(
     headers: HeaderMap,
     Json(payload): Json<StreamUpdate>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
 
@@ -1467,7 +1931,7 @@ async fn admin_room_create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, &state).await {
+    if !check_admin_auth(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
     }
 
@@ -1611,6 +2075,92 @@ async fn check_bearer(headers: &HeaderMap, state: &AppState) -> bool {
     tokens.get(&token).is_some()
 }
 
+async fn check_admin_auth(headers: &HeaderMap, state: &AppState) -> bool {
+    if !check_bearer(headers, state).await {
+        return false;
+    }
+    if !cf_access_enabled(state) {
+        return true;
+    }
+    verify_cf_access(headers, state).await
+}
+
+fn cf_access_enabled(state: &AppState) -> bool {
+    state
+        .cf_access_team_domain
+        .as_ref()
+        .is_some_and(|v| !v.trim().is_empty())
+        && state
+            .cf_access_aud
+            .as_ref()
+            .is_some_and(|v| !v.trim().is_empty())
+}
+
+async fn verify_cf_access(headers: &HeaderMap, state: &AppState) -> bool {
+    let Some(token) = headers
+        .get("CF-Access-Jwt-Assertion")
+        .and_then(|val| val.to_str().ok())
+    else {
+        return false;
+    };
+    verify_cf_access_token(state, token).await
+}
+
+async fn verify_cf_access_token(state: &AppState, token: &str) -> bool {
+    let Some(aud) = state.cf_access_aud.as_ref() else {
+        return false;
+    };
+    let header = match decode_header(token) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let kid = header.kid.unwrap_or_default();
+    let Some(keys) = load_cf_access_jwks(state).await else {
+        return false;
+    };
+    let key = keys
+        .iter()
+        .find(|item| !kid.is_empty() && item.kid == kid)
+        .or_else(|| keys.first());
+    let Some(key) = key else { return false };
+    let decoding_key = match DecodingKey::from_rsa_components(&key.n, &key.e) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&[aud.as_str()]);
+    validation.validate_exp = true;
+    validation.leeway = 60;
+    decode::<CfAccessClaims>(token, &decoding_key, &validation).is_ok()
+}
+
+async fn load_cf_access_jwks(state: &AppState) -> Option<Vec<CfAccessJwk>> {
+    let team = state.cf_access_team_domain.as_ref()?;
+    {
+        let cache = state.cf_access_jwks.read().await;
+        if let Some(cache) = cache.as_ref() {
+            if cache.fetched_at.elapsed() < Duration::from_secs(600) {
+                return Some(cache.keys.clone());
+            }
+        }
+    }
+
+    let host = if team.contains('.') {
+        team.trim().to_string()
+    } else {
+        format!("{}.cloudflareaccess.com", team.trim())
+    };
+    let url = format!("https://{}/cdn-cgi/access/certs", host);
+    let resp = Client::new().get(&url).send().await.ok()?;
+    let payload = resp.json::<CfAccessJwks>().await.ok()?;
+    let mut cache = state.cf_access_jwks.write().await;
+    *cache = Some(CfAccessJwksCache {
+        fetched_at: Instant::now(),
+        keys: payload.keys.clone(),
+    });
+    Some(payload.keys)
+}
+
 async fn viewer_from_header(headers: &HeaderMap, state: &AppState) -> Option<String> {
     let token = headers
         .get("authorization")
@@ -1665,12 +2215,63 @@ fn hash_password(password: &str) -> String {
 }
 
 fn is_valid_email(email: &str) -> bool {
-    let email = email.trim();
-    if email.len() < 5 || !email.contains('@') {
+    let value = email.trim();
+    let mut parts = value.split('@');
+    let local = parts.next().unwrap_or_default();
+    let domain = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
         return false;
     }
-    let parts: Vec<&str> = email.split('@').collect();
-    parts.len() == 2 && parts[1].contains('.')
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+}
+
+fn normalize_host(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('.')
+        .trim_start_matches("www.")
+        .to_lowercase()
+}
+
+fn is_disposable_email_domain(email: &str) -> bool {
+    let domain = email
+        .rsplit('@')
+        .next()
+        .map(normalize_host)
+        .unwrap_or_default();
+    if domain.is_empty() {
+        return true;
+    }
+    let suffix_rules = [
+        "mailinator.com",
+        "guerrillamail.com",
+        "yopmail.com",
+        "tempmail",
+        "10minutemail",
+        "dropmail",
+        "sharklasers.com",
+        "dispostable.com",
+        "maildrop.cc",
+    ];
+    suffix_rules
+        .iter()
+        .any(|rule| domain == *rule || domain.contains(rule))
+}
+
+fn is_edu_or_gov_email_domain(email: &str) -> bool {
+    let domain = email
+        .rsplit('@')
+        .next()
+        .map(normalize_host)
+        .unwrap_or_default();
+    if domain.is_empty() {
+        return false;
+    }
+    domain == "edu"
+        || domain.ends_with(".edu")
+        || domain.ends_with(".edu.cn")
+        || domain == "gov"
+        || domain.ends_with(".gov")
+        || domain.ends_with(".gov.cn")
 }
 
 fn generate_code() -> String {

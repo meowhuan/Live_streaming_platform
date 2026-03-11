@@ -6,6 +6,11 @@ dist/
 # Rust
 server-rust/target/
 
+# Dotnet
+.dotnet/
+windows-widget/bin/
+windows-widget/obj/
+
 # Env / secrets
 .env
 

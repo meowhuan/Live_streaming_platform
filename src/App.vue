@@ -37,6 +37,17 @@ const smtpSaving = ref(false);
 const smtpNotice = ref("");
 const smtpTestTo = ref("");
 const smtpTestSending = ref(false);
+const antiAbuseConfig = ref({
+  verifyEmailRateLimitWindowSecs: 1800,
+  verifyEmailRateLimitMax: 3,
+  verifyEmailRateLimitEmailMax: 2,
+  verifyEmailCooldownSecs: 600,
+  blockDisposableEmail: true,
+  blockEduGovEmail: true,
+  registerTokenTtlSecs: 600
+});
+const antiAbuseSaving = ref(false);
+const antiAbuseNotice = ref("");
 const adminTurnstileToken = ref("");
 const adminTurnstileRef = ref(null);
 let adminTurnstileId = null;
@@ -504,6 +515,73 @@ const loadSmtp = async () => {
   }
 };
 
+const loadViewerAntiAbuse = async () => {
+  if (!adminToken.value) return;
+  try {
+    const res = await fetch("/api/admin/viewer-anti-abuse", {
+      headers: { authorization: `Bearer ${adminToken.value}` }
+    });
+    if (res.status === 401) {
+      clearAdminSession("登录已失效，请重新登录");
+      return;
+    }
+    if (!res.ok) return;
+    const data = await res.json();
+    antiAbuseConfig.value = {
+      verifyEmailRateLimitWindowSecs: data.verify_email_rate_limit_window_secs ?? 1800,
+      verifyEmailRateLimitMax: data.verify_email_rate_limit_max ?? 3,
+      verifyEmailRateLimitEmailMax: data.verify_email_rate_limit_email_max ?? 2,
+      verifyEmailCooldownSecs: data.verify_email_cooldown_secs ?? 600,
+      blockDisposableEmail: data.block_disposable_email ?? true,
+      blockEduGovEmail: data.block_edu_gov_email ?? true,
+      registerTokenTtlSecs: data.register_token_ttl_secs ?? 600
+    };
+  } catch {
+    // ignore
+  }
+};
+
+const saveViewerAntiAbuse = async () => {
+  if (!adminToken.value) return;
+  antiAbuseSaving.value = true;
+  antiAbuseNotice.value = "";
+  try {
+    const payload = {
+      verify_email_rate_limit_window_secs: Number(antiAbuseConfig.value.verifyEmailRateLimitWindowSecs) || 1800,
+      verify_email_rate_limit_max: Number(antiAbuseConfig.value.verifyEmailRateLimitMax) || 3,
+      verify_email_rate_limit_email_max: Number(antiAbuseConfig.value.verifyEmailRateLimitEmailMax) || 2,
+      verify_email_cooldown_secs: Number(antiAbuseConfig.value.verifyEmailCooldownSecs) || 600,
+      block_disposable_email: !!antiAbuseConfig.value.blockDisposableEmail,
+      block_edu_gov_email: !!antiAbuseConfig.value.blockEduGovEmail,
+      register_token_ttl_secs: Number(antiAbuseConfig.value.registerTokenTtlSecs) || 600
+    };
+    const res = await fetch("/api/admin/viewer-anti-abuse", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: `Bearer ${adminToken.value}`
+      },
+      body: JSON.stringify(payload)
+    });
+    if (res.status === 401) {
+      clearAdminSession("登录已失效，请重新登录");
+      return;
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || "保存失败");
+    }
+    antiAbuseNotice.value = "防盗刷配置已保存";
+  } catch (err) {
+    antiAbuseNotice.value = err instanceof Error ? err.message : "保存失败";
+  } finally {
+    antiAbuseSaving.value = false;
+    setTimeout(() => {
+      antiAbuseNotice.value = "";
+    }, 2000);
+  }
+};
+
 const saveSmtp = async () => {
   if (!adminToken.value) return;
   smtpSaving.value = true;
@@ -608,6 +686,7 @@ let refreshTimer = null;
 const enterAdmin = () => {
   loadAll();
   loadSmtp();
+  loadViewerAntiAbuse();
   connectWs();
   if (!refreshTimer) {
     refreshTimer = setInterval(() => {
@@ -807,6 +886,7 @@ onBeforeUnmount(() => {
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#dashboard">控制台</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#ingest">推流配置</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#smtp">SMTP</a>
+            <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#anti-abuse">防盗刷</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#schedule">排期</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#channels">频道</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#ops">运营</a>
@@ -1291,6 +1371,66 @@ onBeforeUnmount(() => {
                 </button>
               </div>
               <span v-if="smtpNotice" class="text-xs text-[#e06b8b]">{{ smtpNotice }}</span>
+            </div>
+          </div>
+        </section>
+
+        <section id="anti-abuse" class="mt-14">
+          <div
+            class="meow-card motion-card p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex items-center justify-between gap-4">
+              <div>
+                <h3 class="font-display text-xl">防盗刷设置</h3>
+                <p class="mt-2 text-sm" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  观众邮箱验证码的频率限制与邮箱规则控制。
+                </p>
+              </div>
+              <button class="meow-btn-ghost motion-press" type="button" @click="loadViewerAntiAbuse">
+                刷新
+              </button>
+            </div>
+            <div class="mt-5 grid gap-4 md:grid-cols-2">
+              <div class="field-group">
+                <label class="field-label">限流窗口（秒）</label>
+                <input v-model="antiAbuseConfig.verifyEmailRateLimitWindowSecs" class="field-input" type="number" placeholder="1800" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">窗口内 IP 最大发送次数</label>
+                <input v-model="antiAbuseConfig.verifyEmailRateLimitMax" class="field-input" type="number" placeholder="3" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">窗口内单邮箱最大发送次数</label>
+                <input v-model="antiAbuseConfig.verifyEmailRateLimitEmailMax" class="field-input" type="number" placeholder="2" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">冷却时间（秒）</label>
+                <input v-model="antiAbuseConfig.verifyEmailCooldownSecs" class="field-input" type="number" placeholder="600" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">注册令牌有效期（秒）</label>
+                <input v-model="antiAbuseConfig.registerTokenTtlSecs" class="field-input" type="number" placeholder="600" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">邮箱策略</label>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="meow-pill motion-press">
+                    <input type="checkbox" class="mr-2" v-model="antiAbuseConfig.blockDisposableEmail" />
+                    拦截一次性邮箱
+                  </label>
+                  <label class="meow-pill motion-press">
+                    <input type="checkbox" class="mr-2" v-model="antiAbuseConfig.blockEduGovEmail" />
+                    拦截 .edu/.gov
+                  </label>
+                </div>
+              </div>
+            </div>
+            <div class="mt-4 flex flex-wrap items-center gap-3">
+              <button class="meow-btn-primary motion-press" type="button" :disabled="antiAbuseSaving" @click="saveViewerAntiAbuse">
+                保存防盗刷配置
+              </button>
+              <span v-if="antiAbuseNotice" class="text-xs text-[#e06b8b]">{{ antiAbuseNotice }}</span>
             </div>
           </div>
         </section>

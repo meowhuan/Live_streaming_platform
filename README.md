@@ -10,6 +10,8 @@
 - 内置 SRT 监听/转发，方便本地推流测试。
 - 观众账号系统 + 邮箱验证码。
 - Turnstile 人机验证。
+- 观众邮箱防盗刷（一次性注册令牌 + 频率限制）。
+- 可选 Cloudflare Access 管理端二次鉴权。
 
 ## 快速开始
 
@@ -44,6 +46,14 @@ npm run dev
 - `VIEWER_TOKEN_DAYS`
 - `TURNSTILE_SECRET`
 - `EMAIL_CODE_TTL_MIN`, `EMAIL_ECHO`
+- `VIEWER_VERIFY_EMAIL_RATE_LIMIT_WINDOW_SEC`
+- `VIEWER_VERIFY_EMAIL_RATE_LIMIT_MAX`
+- `VIEWER_VERIFY_EMAIL_RATE_LIMIT_EMAIL_MAX`
+- `VIEWER_VERIFY_EMAIL_COOLDOWN_SEC`
+- `VIEWER_BLOCK_DISPOSABLE_EMAIL`
+- `VIEWER_BLOCK_EDU_GOV_EMAIL`
+- `VIEWER_REGISTER_TOKEN_TTL_SEC`
+- `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_REPLY_TO`, `SMTP_STARTTLS`
 - `MEDIAMTX_API`, `MEDIAMTX_METRICS`, `MEDIAMTX_WEBRTC`, `MEDIAMTX_HLS`, `MEDIAMTX_PATH`, `MEDIAMTX_POLL_MS`
 - `SRT_LISTEN`, `SRT_FORWARD`
@@ -84,10 +94,13 @@ npm run dev
 - `POST /api/admin/smtp`（保存 SMTP）
 - `GET /api/admin/smtp`（读取 SMTP）
 - `POST /api/admin/smtp/test`（测试邮件）
+- `GET /api/admin/viewer-anti-abuse`（读取防盗刷配置）
+- `POST /api/admin/viewer-anti-abuse`（保存防盗刷配置）
 
 ### 观众端接口
 
 - `POST /api/viewer/login`
+- `POST /api/viewer/register/token`
 - `POST /api/viewer/register/start`
 - `POST /api/viewer/register/verify`
 - `GET /api/viewer/me`
@@ -125,11 +138,18 @@ SRT_FORWARD=srt://127.0.0.1:9001?mode=caller
 
 前端使用：
 
-- Site Key: `TURNSTILE_SITE_SECRET`
+- Site Key: `TURNSTILE_SITE_KEY`
 
 后端需要：
 
 - `TURNSTILE_SECRET`
+
+## Cloudflare Access（可选）
+
+当配置 `CF_ACCESS_TEAM_DOMAIN` 和 `CF_ACCESS_AUD` 时，管理端接口需要同时满足：
+
+- Admin Bearer Token
+- `CF-Access-Jwt-Assertion` 头（由 Cloudflare Access 注入）
 
 ## CF Pages 部署（前端）
 
@@ -157,6 +177,8 @@ A full-stack live streaming platform with a Rust backend, MediaMTX integration, 
 - Built-in SRT listener/relay for ingest testing.
 - Viewer accounts with email verification.
 - Turnstile verification for admin + viewer auth.
+- Viewer email anti-abuse (one-time register token + rate limits).
+- Optional Cloudflare Access for admin APIs.
 
 ## Quick Start
 
@@ -191,6 +213,14 @@ npm run dev
 - `VIEWER_TOKEN_DAYS`
 - `TURNSTILE_SECRET`
 - `EMAIL_CODE_TTL_MIN`, `EMAIL_ECHO`
+- `VIEWER_VERIFY_EMAIL_RATE_LIMIT_WINDOW_SEC`
+- `VIEWER_VERIFY_EMAIL_RATE_LIMIT_MAX`
+- `VIEWER_VERIFY_EMAIL_RATE_LIMIT_EMAIL_MAX`
+- `VIEWER_VERIFY_EMAIL_COOLDOWN_SEC`
+- `VIEWER_BLOCK_DISPOSABLE_EMAIL`
+- `VIEWER_BLOCK_EDU_GOV_EMAIL`
+- `VIEWER_REGISTER_TOKEN_TTL_SEC`
+- `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_REPLY_TO`, `SMTP_STARTTLS`
 - `MEDIAMTX_API`, `MEDIAMTX_METRICS`, `MEDIAMTX_WEBRTC`, `MEDIAMTX_HLS`, `MEDIAMTX_PATH`, `MEDIAMTX_POLL_MS`
 - `SRT_LISTEN`, `SRT_FORWARD`
@@ -231,10 +261,13 @@ npm run dev
 - `POST /api/admin/smtp` (save SMTP)
 - `GET /api/admin/smtp` (load SMTP)
 - `POST /api/admin/smtp/test`
+- `GET /api/admin/viewer-anti-abuse`
+- `POST /api/admin/viewer-anti-abuse`
 
 ### Viewer
 
 - `POST /api/viewer/login`
+- `POST /api/viewer/register/token`
 - `POST /api/viewer/register/start`
 - `POST /api/viewer/register/verify`
 - `GET /api/viewer/me`
@@ -272,11 +305,18 @@ SRT_FORWARD=srt://127.0.0.1:9001?mode=caller
 
 The frontend uses Cloudflare Turnstile with:
 
-- Site Key: `TURNSTILE_SITE_SECRET`
+- Site Key: `TURNSTILE_SITE_KEY`
 
 The backend expects:
 
 - `TURNSTILE_SECRET` in environment
+
+## Cloudflare Access (Optional)
+
+When `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` are set, admin APIs require both:
+
+- Admin Bearer Token
+- `CF-Access-Jwt-Assertion` header (injected by Cloudflare Access)
 
 ## CF Pages Notes (Frontend)
 

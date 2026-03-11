@@ -36,6 +36,8 @@ const viewerCode = ref("");
 const viewerNotice = ref("");
 const viewerSending = ref(false);
 const viewerTurnstileToken = ref("");
+const viewerRegisterToken = ref("");
+const viewerRegisterTokenExpiresAt = ref(0);
 const showViewerAuth = ref(false);
 const showViewerProfile = ref(false);
 const viewerProfile = ref({ username: "", email: "" });
@@ -185,23 +187,32 @@ const loadAll = async () => {
   loading.value = true;
   error.value = "";
   try {
-    const [streamRes, scheduleRes, opsRes, chatRes, playRes] = await Promise.all([
+    const [streamRes, scheduleRes, opsRes, chatRes] = await Promise.all([
       fetchJson("/api/stream"),
       fetchJson("/api/schedule"),
       fetchJson("/api/ops/alerts"),
-      fetchJson("/api/chat/latest"),
-      fetchJson("/api/stream/play")
+      fetchJson("/api/chat/latest")
     ]);
     stream.value = streamRes;
     scheduleList.value = scheduleRes.items || [];
     opsAlerts.value = opsRes.items || [];
     chatMessages.value = (chatRes.items || []).map(normalizeChatMessage);
+    playerError.value = "";
+    let playRes = null;
+    try {
+      playRes = await fetchJson("/api/stream/play");
+    } catch {
+      playRes = null;
+    }
     const normalized = {
       whep: normalizePlayUrl(playRes?.whep || ""),
       hls: normalizePlayUrl(playRes?.hls || "")
     };
     playInfo.value = normalized;
-    if (playInfo.value.whep && playerStatus.value === "idle") {
+    if (!playInfo.value.whep && !playInfo.value.hls) {
+      playerError.value = "未开播";
+      playerStatus.value = "idle";
+    } else if (playInfo.value.whep && playerStatus.value === "idle") {
       startWhep(playInfo.value.whep).catch((err) => {
         playerError.value = err instanceof Error ? err.message : "播放器错误";
         playerStatus.value = "error";
@@ -395,6 +406,27 @@ const sendViewerCode = async () => {
     viewerNotice.value = "请完成人机验证";
     return;
   }
+  const ensureRegisterToken = async () => {
+    if (
+      viewerRegisterToken.value &&
+      viewerRegisterTokenExpiresAt.value > Date.now()
+    ) {
+      return viewerRegisterToken.value;
+    }
+    const res = await fetch("/api/viewer/register/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ turnstileToken: viewerTurnstileToken.value })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || "获取验证码令牌失败");
+    }
+    viewerRegisterToken.value = data.token || "";
+    const expiresIn = Number(data.expiresIn || 0);
+    viewerRegisterTokenExpiresAt.value = Date.now() + expiresIn * 1000;
+    return viewerRegisterToken.value;
+  };
   const email = viewerEmail.value.trim();
   if (!email) {
     viewerNotice.value = "请输入邮箱";
@@ -403,15 +435,23 @@ const sendViewerCode = async () => {
   viewerSending.value = true;
   viewerNotice.value = "";
   try {
+    const registerToken = await ensureRegisterToken();
     const res = await fetch("/api/viewer/register/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, turnstileToken: viewerTurnstileToken.value })
+      body: JSON.stringify({
+        email,
+        registerToken
+      })
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
+      viewerRegisterToken.value = "";
+      viewerRegisterTokenExpiresAt.value = 0;
       throw new Error(data?.error || "验证码发送失败");
     }
+    viewerRegisterToken.value = "";
+    viewerRegisterTokenExpiresAt.value = 0;
     viewerNotice.value = data?.devCode
       ? `验证码已发送（开发模式：${data.devCode}）`
       : "验证码已发送，请查收邮箱";
@@ -588,15 +628,27 @@ const startWhep = async (url) => {
   await pc.setLocalDescription(offer);
   await waitIceGathering(pc);
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/sdp", Accept: "application/sdp" },
-    body: pc.localDescription.sdp
-  });
+  let res = null;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/sdp", Accept: "application/sdp" },
+      body: pc.localDescription.sdp
+    });
+  } catch {
+    playerStatus.value = "idle";
+    playerError.value = "未开播";
+    return;
+  }
 
   if (!res.ok) {
-    playerStatus.value = "error";
     const text = await res.text();
+    if (res.status === 404 && text.includes("no stream is available")) {
+      playerStatus.value = "idle";
+      playerError.value = "未开播";
+      return;
+    }
+    playerStatus.value = "error";
     playerError.value = `WHEP 连接失败 ${res.status}: ${text || "Bad Request"}`;
     return;
   }
@@ -843,7 +895,7 @@ watch(chatMessages, () => {
             </div>
           </div>
           </div>
-          <div v-if="playerError" class="mt-2 text-xs text-[#e06b8b]">{{ playerError }}</div>
+          <div v-if="playerError && !streamUnavailable" class="player-error mt-2 text-xs text-[#e06b8b]">{{ playerError }}</div>
           <div class="metrics-bar">
             <span>在线观众 {{ stream.viewers }}</span>
             <span class="metric-pill" :class="`metric-${bitrateStatus()}`">码率 {{ stream.bitrate }}</span>
