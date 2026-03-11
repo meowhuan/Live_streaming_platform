@@ -63,6 +63,7 @@ cargo build --release
 6. 反向代理（可选，但推荐）：
    - `/api` 与 `/ws` 反代到后端 `PORT`
    - `/live/stream/whep`、`/live/stream` 等播放路径可按需反代至 MediaMTX
+   - 需透传 `X-Forwarded-Proto`，后端会根据它生成 HTTPS 播放地址
 
 7. MediaMTX 鉴权：
    - 在 `mediamtx.yml` 中将鉴权回调指向 `POST /api/mediamtx/auth`
@@ -343,6 +344,7 @@ cargo build --release
 6. Reverse proxy (recommended):
    - proxy `/api` and `/ws` to backend `PORT`
    - proxy `/live/stream/whep` or other playback paths to MediaMTX if needed
+   - pass `X-Forwarded-Proto` so the backend can emit HTTPS playback URLs
 
 7. MediaMTX auth:
    - set auth hook to `POST /api/mediamtx/auth`

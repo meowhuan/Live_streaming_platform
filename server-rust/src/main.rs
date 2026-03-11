@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message as MailMessage,
+    message::header::ContentType,
     transport::smtp::authentication::Credentials,
     Tokio1Executor,
 };
@@ -893,8 +894,8 @@ async fn get_stream_play(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let read = ensure_read_token(&state).await;
-    let webrtc_base = public_media_base(&state.mediamtx_webrtc, headers.get("host"));
-    let hls_base = public_media_base(&state.mediamtx_hls, headers.get("host"));
+    let webrtc_base = public_media_base(&state.mediamtx_webrtc, &headers);
+    let hls_base = public_media_base(&state.mediamtx_hls, &headers);
     let whep = format!(
         "{}/{}/whep?token={}",
         webrtc_base.trim_end_matches('/'),
@@ -914,24 +915,32 @@ async fn get_stream_play(
     }))
 }
 
-fn public_media_base(base: &str, host_header: Option<&HeaderValue>) -> String {
-    let Some(host_header) = host_header.and_then(|v| v.to_str().ok()) else {
-        return base.to_string();
-    };
+fn public_media_base(base: &str, headers: &HeaderMap) -> String {
     let (scheme, rest) = base.split_once("://").unwrap_or(("http", base));
     let (base_host_port, base_path) = rest.split_once('/').unwrap_or((rest, ""));
     let (base_host, base_port) = split_host_port(base_host_port);
     if !is_local_host(&base_host) {
         return base.to_string();
     }
+    let forwarded_host = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.trim().is_empty());
+    let host_header = forwarded_host
+        .or_else(|| headers.get("host").and_then(|v| v.to_str().ok()));
+    let Some(host_header) = host_header else {
+        return base.to_string();
+    };
     let (host_only, _host_port) = split_host_port(host_header);
     if is_local_host(&host_only) {
         return base.to_string();
     }
-    let rebuilt_host = match base_port {
-        Some(port) => format!("{host_only}:{port}"),
-        None => host_only,
-    };
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.trim().is_empty());
+    let scheme = forwarded_proto.unwrap_or(scheme);
+    let rebuilt_host = host_header.to_string();
     if base_path.is_empty() {
         format!("{scheme}://{rebuilt_host}")
     } else {
@@ -2353,6 +2362,58 @@ async fn send_email_code_with_subject(
     subject: &str,
     body_tpl: &str,
 ) -> Result<(), String> {
+    fn escape_html(input: &str) -> String {
+        input
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\n', "<br>")
+    }
+
+    let body_text = body_tpl.replace("{code}", code);
+    let body_html = {
+        let safe_subject = escape_html(subject);
+        let safe_body = escape_html(&body_text);
+        let safe_code = escape_html(code);
+        let code_block = if !safe_code.trim().is_empty() {
+            format!(
+                r#"<div style="margin:16px 0;display:inline-block;background:#f7f1ff;border:1px solid #e6dcff;color:#5b3fa7;padding:10px 14px;border-radius:999px;font-size:16px;font-weight:700;letter-spacing:0.06em;">{}</div>"#,
+                safe_code
+            )
+        } else {
+            String::new()
+        };
+
+        format!(
+            r#"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>{subject}</title>
+</head>
+<body style="margin:0;padding:0;background:#f7f5ff;font-family:'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;color:#2b2440;">
+  <div style="max-width:560px;margin:0 auto;padding:32px 18px;">
+    <div style="background:linear-gradient(135deg,#fdf3f8,#f1f3ff);border:1px solid #eadff7;border-radius:18px;padding:28px 26px;box-shadow:0 12px 24px rgba(83,63,145,0.08);">
+      <div style="font-size:12px;letter-spacing:0.22em;text-transform:uppercase;color:#9a8cc4;">Meow Live Room</div>
+      <h1 style="margin:10px 0 6px;font-size:20px;color:#2c204f;">{subject}</h1>
+      <div style="height:1px;background:rgba(140,120,190,0.18);margin:12px 0 16px;"></div>
+      <div style="font-size:14px;line-height:1.7;color:#3a2f56;">{body}</div>
+      {code_block}
+      <div style="margin-top:18px;font-size:12px;color:#9a8cc4;">如果不是你本人操作，请忽略这封邮件。</div>
+    </div>
+    <div style="margin-top:16px;text-align:center;font-size:12px;color:#b7a9d9;">
+      © 2026 Meowhuan Live Room
+    </div>
+  </div>
+</body>
+</html>"#,
+            subject = safe_subject,
+            body = safe_body,
+            code_block = code_block
+        )
+    };
+
     let mut builder = MailMessage::builder()
         .from(config.from.parse().map_err(|_| "smtp_from_invalid")?)
         .to(to.parse().map_err(|_| "smtp_to_invalid")?)
@@ -2360,8 +2421,10 @@ async fn send_email_code_with_subject(
     if let Some(reply_to) = &config.reply_to {
         builder = builder.reply_to(reply_to.parse().map_err(|_| "smtp_reply_invalid")?);
     }
-    let body = body_tpl.replace("{code}", code);
-    let email = builder.body(body).map_err(|_| "smtp_build_failed")?;
+    let email = builder
+        .header(ContentType::TEXT_HTML)
+        .body(body_html)
+        .map_err(|_| "smtp_build_failed")?;
 
     let creds = Credentials::new(config.username.clone(), config.password.clone());
     let mailer = if config.starttls {
