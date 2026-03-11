@@ -815,6 +815,9 @@ onMounted(() => {
   watch(() => !isAuthed.value, (show) => {
     if (show) renderAdminTurnstile();
   }, { immediate: true });
+  watch(cfAccessEnabled, () => {
+    if (!isAuthed.value) renderAdminTurnstile();
+  });
   watch([adminTurnstileToken, cfAccessEnabled, isAuthed], () => {
     if (!cfAccessEnabled.value) return;
     if (isAuthed.value) return;
