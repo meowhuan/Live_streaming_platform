@@ -96,8 +96,18 @@ const toggleTheme = () => {
   isNight.value = !isNight.value;
 };
 
+const apiBase = () => import.meta.env.VITE_API_BASE || window.location.origin;
+
+const apiUrl = (path) => {
+  if (!path) return apiBase();
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  const base = apiBase().replace(/\/$/, "");
+  const suffix = path.startsWith("/") ? path : `/${path}`;
+  return `${base}${suffix}`;
+};
+
 const fetchJson = async (url) => {
-  const res = await fetch(url);
+  const res = await fetch(apiUrl(url));
   if (!res.ok) {
     throw new Error(`请求失败: ${res.status}`);
   }
@@ -390,6 +400,11 @@ const copyText = async (text) => {
 const wsUrl = () => {
   const envUrl = import.meta.env.VITE_WS_URL;
   if (envUrl) return envUrl;
+  if (import.meta.env.VITE_API_BASE) {
+    const base = import.meta.env.VITE_API_BASE.replace(/\/$/, "");
+    const proto = base.startsWith("https://") ? "wss" : "ws";
+    return `${proto}://${base.replace(/^https?:\/\//, "")}/ws`;
+  }
   if (import.meta.env.DEV) return "ws://localhost:5174/ws";
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   return `${proto}://${window.location.host}/ws`;
@@ -407,7 +422,7 @@ const adminFetch = async (url, payload) => {
   actionNotice.value = "";
   try {
     const hasBody = payload !== undefined && payload !== null;
-    const res = await fetch(url, {
+    const res = await fetch(apiUrl(url), {
       method: "POST",
       headers: {
         ...(hasBody ? { "Content-Type": "application/json" } : {}),
@@ -449,7 +464,7 @@ const loginAdmin = async () => {
   adminSaving.value = true;
   actionNotice.value = "";
   try {
-    const res = await fetch("/api/admin/login", {
+    const res = await fetch(apiUrl("/api/admin/login"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -490,7 +505,7 @@ const logoutAdmin = () => {
 const loadSmtp = async () => {
   if (!adminToken.value) return;
   try {
-    const res = await fetch("/api/admin/smtp", {
+    const res = await fetch(apiUrl("/api/admin/smtp"), {
       headers: { authorization: `Bearer ${adminToken.value}` }
     });
     if (res.status === 401) {
@@ -524,7 +539,7 @@ const loginAdminAccess = async () => {
   adminSaving.value = true;
   actionNotice.value = "";
   try {
-    const res = await fetch("/api/admin/turnstile-login", {
+    const res = await fetch(apiUrl("/api/admin/turnstile-login"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -558,7 +573,7 @@ const loginAdminAccess = async () => {
 const loadViewerAntiAbuse = async () => {
   if (!adminToken.value) return;
   try {
-    const res = await fetch("/api/admin/viewer-anti-abuse", {
+    const res = await fetch(apiUrl("/api/admin/viewer-anti-abuse"), {
       headers: { authorization: `Bearer ${adminToken.value}` }
     });
     if (res.status === 401) {
@@ -595,7 +610,7 @@ const saveViewerAntiAbuse = async () => {
       block_edu_gov_email: !!antiAbuseConfig.value.blockEduGovEmail,
       register_token_ttl_secs: Number(antiAbuseConfig.value.registerTokenTtlSecs) || 600
     };
-    const res = await fetch("/api/admin/viewer-anti-abuse", {
+    const res = await fetch(apiUrl("/api/admin/viewer-anti-abuse"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -636,7 +651,7 @@ const saveSmtp = async () => {
       reply_to: smtpConfig.value.replyTo || null,
       starttls: smtpConfig.value.starttls
     };
-    const res = await fetch("/api/admin/smtp", {
+    const res = await fetch(apiUrl("/api/admin/smtp"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -673,7 +688,7 @@ const sendSmtpTest = async () => {
   smtpTestSending.value = true;
   smtpNotice.value = "";
   try {
-    const res = await fetch("/api/admin/smtp/test", {
+    const res = await fetch(apiUrl("/api/admin/smtp/test"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -795,7 +810,7 @@ onMounted(() => {
       .catch(() => false);
 
   Promise.all([
-    fetch("/api/admin/access-mode")
+    fetch(apiUrl("/api/admin/access-mode"))
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (data && typeof data.cf_access_enabled === "boolean") {

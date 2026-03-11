@@ -155,7 +155,7 @@ const reportWhepStats = async () => {
     if (playoutDelayMs !== null) {
       stream.value.playoutDelay = `${Math.round(playoutDelayMs)}ms`;
     }
-    await fetch("/api/stream/telemetry", {
+    await fetch(apiUrl("/api/stream/telemetry"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -175,8 +175,18 @@ const normalizeChatMessage = (item) => {
   return { ...item, ts: Number.isNaN(ts) ? Date.now() : ts };
 };
 
+const apiBase = () => import.meta.env.VITE_API_BASE || window.location.origin;
+
+const apiUrl = (path) => {
+  if (!path) return apiBase();
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  const base = apiBase().replace(/\/$/, "");
+  const suffix = path.startsWith("/") ? path : `/${path}`;
+  return `${base}${suffix}`;
+};
+
 const fetchJson = async (url) => {
-  const res = await fetch(url);
+  const res = await fetch(apiUrl(url));
   if (!res.ok) {
     throw new Error(`请求失败: ${res.status}`);
   }
@@ -228,6 +238,11 @@ const loadAll = async () => {
 const wsUrl = () => {
   const envUrl = import.meta.env.VITE_WS_URL;
   if (envUrl) return envUrl;
+  if (import.meta.env.VITE_API_BASE) {
+    const base = import.meta.env.VITE_API_BASE.replace(/\/$/, "");
+    const proto = base.startsWith("https://") ? "wss" : "ws";
+    return `${proto}://${base.replace(/^https?:\/\//, "")}/ws`;
+  }
   if (import.meta.env.DEV) return "ws://localhost:5174/ws";
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   return `${proto}://${window.location.host}/ws`;
@@ -341,7 +356,7 @@ const sendChat = async () => {
   chatSending.value = true;
   try {
     localStorage.setItem("viewer_name", user);
-    const res = await fetch("/api/chat/send", {
+    const res = await fetch(apiUrl("/api/chat/send"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -370,7 +385,7 @@ const loginViewer = async () => {
   viewerSending.value = true;
   viewerNotice.value = "";
   try {
-    const res = await fetch("/api/viewer/login", {
+    const res = await fetch(apiUrl("/api/viewer/login"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -413,7 +428,7 @@ const sendViewerCode = async () => {
     ) {
       return viewerRegisterToken.value;
     }
-    const res = await fetch("/api/viewer/register/token", {
+    const res = await fetch(apiUrl("/api/viewer/register/token"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ turnstileToken: viewerTurnstileToken.value })
@@ -436,7 +451,7 @@ const sendViewerCode = async () => {
   viewerNotice.value = "";
   try {
     const registerToken = await ensureRegisterToken();
-    const res = await fetch("/api/viewer/register/start", {
+    const res = await fetch(apiUrl("/api/viewer/register/start"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -479,7 +494,7 @@ const registerViewer = async () => {
   viewerSending.value = true;
   viewerNotice.value = "";
   try {
-    const res = await fetch("/api/viewer/register/verify", {
+    const res = await fetch(apiUrl("/api/viewer/register/verify"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, username, password, code, turnstileToken: viewerTurnstileToken.value })
@@ -510,7 +525,7 @@ const registerViewer = async () => {
 const loadViewerMe = async () => {
   if (!viewerToken.value) return;
   try {
-    const res = await fetch("/api/viewer/me", {
+    const res = await fetch(apiUrl("/api/viewer/me"), {
       headers: { authorization: `Bearer ${viewerToken.value}` }
     });
     if (!res.ok) {
@@ -533,7 +548,7 @@ const loadViewerMe = async () => {
 const loadViewerProfile = async () => {
   if (!viewerToken.value) return;
   try {
-    const res = await fetch("/api/viewer/profile", {
+    const res = await fetch(apiUrl("/api/viewer/profile"), {
       headers: { authorization: `Bearer ${viewerToken.value}` }
     });
     if (!res.ok) return;
@@ -552,7 +567,7 @@ const saveViewerProfile = async () => {
   viewerProfileSaving.value = true;
   viewerNotice.value = "";
   try {
-    const res = await fetch("/api/viewer/profile", {
+    const res = await fetch(apiUrl("/api/viewer/profile"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
