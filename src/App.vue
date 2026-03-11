@@ -789,14 +789,29 @@ onMounted(() => {
   window.onAdminTurnstile = (token) => {
     adminTurnstileToken.value = token;
   };
-  fetch("/api/admin/access-mode")
-    .then((res) => (res.ok ? res.json() : null))
-    .then((data) => {
-      if (data && typeof data.cf_access_enabled === "boolean") {
-        cfAccessEnabled.value = data.cf_access_enabled;
-      }
-    })
-    .catch(() => {});
+  const detectAccess = () =>
+    fetch("/cdn-cgi/access/get-identity")
+      .then((res) => res.ok)
+      .catch(() => false);
+
+  Promise.all([
+    fetch("/api/admin/access-mode")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data && typeof data.cf_access_enabled === "boolean") {
+          return data.cf_access_enabled;
+        }
+        return null;
+      })
+      .catch(() => null),
+    detectAccess()
+  ]).then(([apiFlag, identityOk]) => {
+    if (apiFlag !== null) {
+      cfAccessEnabled.value = apiFlag;
+      return;
+    }
+    cfAccessEnabled.value = identityOk;
+  });
   watch(() => !isAuthed.value, (show) => {
     if (show) renderAdminTurnstile();
   }, { immediate: true });
