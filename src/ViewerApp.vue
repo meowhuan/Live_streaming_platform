@@ -737,13 +737,17 @@ const renderViewerTurnstile = async () => {
   if (turnstileLoginRef.value) {
     turnstileLoginId = window.turnstile.render(turnstileLoginRef.value, {
       sitekey: "0x4AAAAAACncUgjk6YpyY6aB",
-      callback: "onViewerTurnstile"
+      callback: (token) => {
+        viewerTurnstileToken.value = token;
+      }
     });
   }
   if (turnstileRegisterRef.value) {
     turnstileRegisterId = window.turnstile.render(turnstileRegisterRef.value, {
       sitekey: "0x4AAAAAACncUgjk6YpyY6aB",
-      callback: "onViewerTurnstile"
+      callback: (token) => {
+        viewerTurnstileToken.value = token;
+      }
     });
   }
 };

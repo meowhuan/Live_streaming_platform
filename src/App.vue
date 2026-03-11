@@ -800,6 +800,13 @@ onMounted(() => {
   watch(() => !isAuthed.value, (show) => {
     if (show) renderAdminTurnstile();
   }, { immediate: true });
+  watch([adminTurnstileToken, cfAccessEnabled, isAuthed], () => {
+    if (!cfAccessEnabled.value) return;
+    if (isAuthed.value) return;
+    if (!adminTurnstileToken.value) return;
+    if (adminSaving.value) return;
+    loginAdminAccess();
+  });
   if (adminToken.value) {
     enterAdmin();
   } else {
@@ -832,7 +839,9 @@ const renderAdminTurnstile = async () => {
   }
   adminTurnstileId = window.turnstile.render(adminTurnstileRef.value, {
     sitekey: "0x4AAAAAACncUgjk6YpyY6aB",
-    callback: "onAdminTurnstile"
+    callback: (token) => {
+      adminTurnstileToken.value = token;
+    }
   });
 };
 
