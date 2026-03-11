@@ -34,6 +34,82 @@ npm run dev
 - 观众端：`http://localhost:5173/`
 - 管理端：`http://localhost:5173/admin.html`
 
+## 后端部署（生产）
+
+以下步骤以 Linux 服务器为例：
+
+1. 安装依赖：
+   - Rust（stable）
+   - MySQL
+   - MediaMTX
+2. 创建数据库：
+   - 数据库名：`live_streaming`
+3. 配置环境变量：
+   - 复制 `.env.example` → `.env`
+   - 根据实际域名/端口修改（重点：`PORT`、`MEDIAMTX_*`、`TURNSTILE_SECRET`、`CF_ACCESS_*`）
+4. 构建后端：
+
+```bash
+cd server-rust
+cargo build --release
+```
+
+5. 启动（示例）：
+
+```bash
+./server-rust/target/release/server-rust
+```
+
+6. 反向代理（可选，但推荐）：
+   - `/api` 与 `/ws` 反代到后端 `PORT`
+   - `/live/stream/whep`、`/live/stream` 等播放路径可按需反代至 MediaMTX
+
+7. MediaMTX 鉴权：
+   - 在 `mediamtx.yml` 中将鉴权回调指向 `POST /api/mediamtx/auth`
+
+8. 端口建议：
+   - 后端：`5174`
+   - MediaMTX WHEP：`8889`
+   - MediaMTX HLS：`8888`
+   - MediaMTX SRT：`8890`
+
+如需 systemd 启动服务，可将 `server-rust` 可执行文件放入固定路径，并在 service 中读取 `.env`。
+
+### systemd 服务模板（Linux）
+
+假设后端部署在 `/opt/meow-live`：
+
+```ini
+[Unit]
+Description=Meow Live Streaming Backend
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/meow-live/server-rust
+ExecStart=/opt/meow-live/server-rust/target/release/server-rust
+Restart=on-failure
+RestartSec=3
+EnvironmentFile=/opt/meow-live/.env
+
+# 安全建议
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启用方式：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable meow-live
+sudo systemctl start meow-live
+sudo systemctl status meow-live
+```
+
 ## 环境变量
 
 ### 后端（Rust）
@@ -200,6 +276,82 @@ npm run dev
 5. Visit:
 - Viewer: `http://localhost:5173/`
 - Admin: `http://localhost:5173/admin.html`
+
+## Backend Deployment (Production)
+
+Example for Linux servers:
+
+1. Install dependencies:
+   - Rust (stable)
+   - MySQL
+   - MediaMTX
+2. Create database:
+   - name: `live_streaming`
+3. Configure environment:
+   - copy `.env.example` → `.env`
+   - update `PORT`, `MEDIAMTX_*`, `TURNSTILE_SECRET`, `CF_ACCESS_*`
+4. Build backend:
+
+```bash
+cd server-rust
+cargo build --release
+```
+
+5. Run:
+
+```bash
+./server-rust/target/release/server-rust
+```
+
+6. Reverse proxy (recommended):
+   - proxy `/api` and `/ws` to backend `PORT`
+   - proxy `/live/stream/whep` or other playback paths to MediaMTX if needed
+
+7. MediaMTX auth:
+   - set auth hook to `POST /api/mediamtx/auth`
+
+8. Suggested ports:
+   - backend: `5174`
+   - MediaMTX WHEP: `8889`
+   - MediaMTX HLS: `8888`
+   - MediaMTX SRT: `8890`
+
+If you use systemd, place the binary in a fixed path and load `.env` in the service unit.
+
+### systemd Service Template (Linux)
+
+Assuming the backend lives in `/opt/meow-live`:
+
+```ini
+[Unit]
+Description=Meow Live Streaming Backend
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/meow-live/server-rust
+ExecStart=/opt/meow-live/server-rust/target/release/server-rust
+Restart=on-failure
+RestartSec=3
+EnvironmentFile=/opt/meow-live/.env
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable meow-live
+sudo systemctl start meow-live
+sudo systemctl status meow-live
+```
 
 ## Environment Variables
 
