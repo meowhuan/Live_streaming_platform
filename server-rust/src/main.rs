@@ -78,6 +78,7 @@ struct AppState {
     clip_min_secs: u64,
     clip_max_secs: u64,
     clip_dir: String,
+    clip_ttl: Duration,
     ffmpeg_bin: String,
     mediamtx_ll_hls: Option<String>,
     thumbnail_interval: Duration,
@@ -394,6 +395,7 @@ async fn main() {
     let clip_min_secs = env_u64("CLIP_MIN_SECS", 15);
     let clip_max_secs = env_u64("CLIP_MAX_SECS", 30);
     let clip_dir = std::env::var("CLIP_DIR").unwrap_or_else(|_| "public/clips".to_string());
+    let clip_ttl = Duration::from_secs(env_u64("CLIP_TTL_SECS", 3600));
     let ffmpeg_bin = std::env::var("FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string());
     let thumbnail_interval = Duration::from_secs(env_u64("THUMBNAIL_INTERVAL_SECS", 30).max(10));
     let thumbnail_source = std::env::var("THUMBNAIL_SOURCE").ok().filter(|v| !v.trim().is_empty());
@@ -468,6 +470,7 @@ async fn main() {
         clip_min_secs,
         clip_max_secs,
         clip_dir,
+        clip_ttl,
         ffmpeg_bin,
         mediamtx_ll_hls,
         thumbnail_interval,
@@ -584,6 +587,11 @@ async fn main() {
     let thumb_state = state_for_srt.clone();
     tokio::spawn(async move {
         run_thumbnail_loop(thumb_state).await;
+    });
+
+    let clip_state = state_for_srt.clone();
+    tokio::spawn(async move {
+        run_clip_cleanup_loop(clip_state).await;
     });
 
     axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), router.with_state(state_for_srt))
@@ -956,6 +964,11 @@ fn default_notify_templates() -> Value {
         "schedule": {
             "title": "排期已更新",
             "message": "今日排期已同步，下一场：{scheduleTime} {scheduleTitle}",
+            "url": ""
+        },
+        "viewer_rename": {
+            "title": "账号用户名已更新",
+            "message": "因用户名重复或与主播同名，系统已自动更新你的用户名。\n\n旧用户名：{oldName}\n新用户名：{newName}\n\n如需修改，请登录后在个人资料中更新。",
             "url": ""
         },
         "live_url": "",
@@ -2082,6 +2095,16 @@ fn file_extension_from_url(url: &str) -> Option<&str> {
     std::path::Path::new(clean).extension().and_then(|ext| ext.to_str())
 }
 
+fn clip_filename_from_url(url: &str) -> Option<String> {
+    let clean = url.split('?').next().unwrap_or(url);
+    let name = clean.rsplit('/').next().unwrap_or(clean);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 async fn fetch_playlist(client: &Client, url: &str) -> Result<String, String> {
     client
         .get(url)
@@ -2195,6 +2218,53 @@ async fn run_thumbnail_loop(state: Arc<AppState>) {
         if run_ffmpeg(&state.ffmpeg_bin, &args).await.is_ok() {
             let _ = fs::rename(&output_tmp, &output_path).await;
         }
+    }
+}
+
+async fn run_clip_cleanup_loop(state: Arc<AppState>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(300));
+    loop {
+        ticker.tick().await;
+        if state.clip_ttl.as_secs() == 0 {
+            continue;
+        }
+        cleanup_expired_clips(&state).await;
+    }
+}
+
+async fn cleanup_expired_clips(state: &Arc<AppState>) {
+    let ttl_secs = state.clip_ttl.as_secs() as i64;
+    if ttl_secs <= 0 {
+        return;
+    }
+    let expired: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, url FROM clips WHERE created_at < (NOW() - INTERVAL ? SECOND)"
+    )
+    .bind(ttl_secs)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    if expired.is_empty() {
+        return;
+    }
+
+    let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let clip_root = if Path::new(&state.clip_dir).is_absolute() {
+        PathBuf::from(&state.clip_dir)
+    } else {
+        base_dir.join(&state.clip_dir)
+    };
+
+    for (clip_id, url) in expired {
+        if let Some(filename) = clip_filename_from_url(&url) {
+            let path = clip_root.join(filename);
+            let _ = fs::remove_file(&path).await;
+        }
+        let _ = sqlx::query("DELETE FROM clips WHERE id = ?")
+            .bind(&clip_id)
+            .execute(&state.pool)
+            .await;
     }
 }
 
@@ -3540,55 +3610,74 @@ async fn is_reserved_username(state: &AppState, username: &str) -> bool {
 }
 
 async fn cleanup_duplicate_viewers(state: &AppState) {
-    let accounts = get_viewer_accounts(&state.pool).await;
+    let mut accounts = get_viewer_accounts(&state.pool).await;
     if accounts.is_empty() {
         return;
     }
     let reserved = reserved_usernames(state).await;
-    let mut grouped: HashMap<String, Vec<ViewerAccount>> = HashMap::new();
-    for acc in accounts {
-        grouped.entry(normalize_username(&acc.username)).or_default().push(acc);
+    let mut used: HashSet<String> = accounts.iter().map(|acc| normalize_username(&acc.username)).collect();
+    let mut renamed: Vec<(String, String, String)> = Vec::new();
+
+    let mut grouped: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, acc) in accounts.iter().enumerate() {
+        grouped.entry(normalize_username(&acc.username)).or_default().push(idx);
     }
 
-    let mut kept = Vec::new();
-    let mut removed: Vec<(ViewerAccount, &'static str)> = Vec::new();
-    for (name, mut group) in grouped {
-        group.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        if reserved.contains(&name) {
-            for acc in group {
-                removed.push((acc, "reserved"));
+    for (name, mut indices) in grouped {
+        indices.sort_by_key(|idx| accounts[*idx].created_at.clone());
+        let mut keep_first = true;
+        for idx in indices {
+            let must_rename = reserved.contains(&name) || !keep_first;
+            if must_rename {
+                let old_name = accounts[idx].username.clone();
+                let mut next;
+                loop {
+                    let suffix = rand_u64() % 10000;
+                    next = format!("meow_{:04}", suffix);
+                    if !used.contains(&normalize_username(&next)) && !reserved.contains(&normalize_username(&next)) {
+                        break;
+                    }
+                }
+                used.insert(normalize_username(&next));
+                accounts[idx].username = next.clone();
+                renamed.push((old_name, next, accounts[idx].email.clone()));
             }
-            continue;
-        }
-        let mut iter = group.into_iter();
-        if let Some(first) = iter.next() {
-            kept.push(first);
-        }
-        for acc in iter {
-            removed.push((acc, "duplicate"));
+            keep_first = false;
         }
     }
 
-    if removed.is_empty() {
+    if renamed.is_empty() {
         return;
     }
 
-    save_viewer_accounts(&state.pool, &kept).await;
+    save_viewer_accounts(&state.pool, &accounts).await;
 
     let mut tokens = state.viewer_tokens.write().await;
-    let removed_names: HashSet<String> = removed.iter().map(|(acc, _)| normalize_username(&acc.username)).collect();
-    tokens.retain(|_, session| !removed_names.contains(&normalize_username(&session.username)));
+    for (old_name, new_name, _) in renamed.iter() {
+        for session in tokens.values_mut() {
+            if session.username.eq_ignore_ascii_case(old_name) {
+                session.username = new_name.clone();
+            }
+        }
+    }
     drop(tokens);
 
     let smtp = state.smtp.read().await.clone();
     if let Some(smtp_cfg) = smtp {
-        for (acc, reason) in removed {
-            let subject = "账号清理通知";
-            let body = match reason {
-                "reserved" => "你的用户名与主播同名，系统已自动清理该账号。请更换用户名后重新注册。",
-                _ => "你的用户名与其他用户重复，系统已自动清理该账号。请更换用户名后重新注册。",
-            };
-            let _ = send_email_code_with_subject(&smtp_cfg, &acc.email, "", subject, body).await;
+        let templates = get_json(&state.pool, "notify_templates", default_notify_templates()).await;
+        for (old_name, new_name, email) in renamed {
+            let mut ctx = HashMap::new();
+            ctx.insert("oldName".to_string(), old_name.clone());
+            ctx.insert("newName".to_string(), new_name.clone());
+            let (title, message, _) = resolve_notify_template(
+                &templates,
+                "viewer_rename",
+                &ctx,
+                "账号用户名已更新",
+                "你的用户名已更新。",
+                "",
+            );
+            let _ = send_email_code_with_subject(&smtp_cfg, &email, "", &title, &message).await;
         }
     }
 }
