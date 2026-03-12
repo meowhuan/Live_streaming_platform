@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{
@@ -32,7 +33,10 @@ use lettre::{
 };
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
+use tokio::process::Command;
+use tokio::fs;
 use tower_http::cors::CorsLayer;
+use chrono::TimeZone;
 use tracing::info;
 use tracing_subscriber::fmt::Subscriber;
 
@@ -66,6 +70,17 @@ struct AppState {
     telegram_bot_token: Option<String>,
     chat_filter_words: Vec<String>,
     public_base_url: String,
+    stats_last_written: RwLock<Instant>,
+    replay_max_seconds: u64,
+    hls_segment_duration_secs: u64,
+    hls_segment_count: u64,
+    clip_min_secs: u64,
+    clip_max_secs: u64,
+    clip_dir: String,
+    ffmpeg_bin: String,
+    mediamtx_ll_hls: Option<String>,
+    thumbnail_interval: Duration,
+    thumbnail_source: Option<String>,
 }
 
 const ADMIN_COOKIE: &str = "meow_admin_token";
@@ -316,12 +331,41 @@ struct TelemetryPayload {
     fps: Option<f64>,
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(sqlx::FromRow)]
+struct ChatMessageRow {
+    id: i64,
+    user: String,
+    text: String,
+    created_at: String,
+    msg_count: i64,
+}
+
+#[derive(Serialize)]
 struct ChatMessage {
     id: i64,
     user: String,
     text: String,
     created_at: String,
+    msg_count: i64,
+    level: u32,
+    level_label: String,
+}
+
+#[derive(Deserialize)]
+struct ClipCreatePayload {
+    #[serde(rename = "lengthSecs")]
+    length_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct LeaderboardQuery {
+    limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    limit: Option<u64>,
+    since: Option<i64>,
 }
 
 #[tokio::main]
@@ -341,7 +385,17 @@ async fn main() {
     let mediamtx_path = std::env::var("MEDIAMTX_PATH").unwrap_or_else(|_| "live/stream".to_string());
     let mediamtx_webrtc = std::env::var("MEDIAMTX_WEBRTC").unwrap_or_else(|_| "http://127.0.0.1:8889".to_string());
     let mediamtx_hls = std::env::var("MEDIAMTX_HLS").unwrap_or_else(|_| "http://127.0.0.1:8888".to_string());
+    let mediamtx_ll_hls = std::env::var("MEDIAMTX_LL_HLS").ok().filter(|v| !v.trim().is_empty());
     let mediamtx_poll = env_u64("MEDIAMTX_POLL_MS", 2000);
+    let hls_segment_duration_secs = env_u64("HLS_SEGMENT_DURATION_SECS", 2);
+    let hls_segment_count = env_u64("HLS_SEGMENT_COUNT", 60);
+    let replay_max_seconds = env_u64("REPLAY_MAX_SECONDS", 120);
+    let clip_min_secs = env_u64("CLIP_MIN_SECS", 15);
+    let clip_max_secs = env_u64("CLIP_MAX_SECS", 30);
+    let clip_dir = std::env::var("CLIP_DIR").unwrap_or_else(|_| "public/clips".to_string());
+    let ffmpeg_bin = std::env::var("FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string());
+    let thumbnail_interval = Duration::from_secs(env_u64("THUMBNAIL_INTERVAL_SECS", 30).max(10));
+    let thumbnail_source = std::env::var("THUMBNAIL_SOURCE").ok().filter(|v| !v.trim().is_empty());
     let email_code_ttl = Duration::from_secs(env_u64("EMAIL_CODE_TTL_MIN", 10) * 60);
     let email_echo = std::env::var("EMAIL_ECHO")
         .map(|val| val.to_lowercase() != "false")
@@ -406,6 +460,17 @@ async fn main() {
         telegram_bot_token,
         chat_filter_words,
         public_base_url,
+        stats_last_written: RwLock::new(Instant::now() - Duration::from_secs(3600)),
+        replay_max_seconds,
+        hls_segment_duration_secs,
+        hls_segment_count,
+        clip_min_secs,
+        clip_max_secs,
+        clip_dir,
+        ffmpeg_bin,
+        mediamtx_ll_hls,
+        thumbnail_interval,
+        thumbnail_source,
     };
 
     {
@@ -439,13 +504,21 @@ async fn main() {
         .route("/api/ingest/config", get(get_ingest))
         .route("/api/stream/ingest", get(get_stream_ingest))
         .route("/api/stream/play", get(get_stream_play))
+        .route("/api/stream/replay", get(get_stream_replay))
         .route("/api/stream/telemetry", post(post_stream_telemetry))
+        .route("/api/live/status", get(get_live_status))
+        .route("/api/live/stats", get(get_live_stats))
+        .route("/api/live/history", get(get_live_history))
+        .route("/api/live/countdown", get(get_live_countdown))
         .route("/api/schedule", get(get_schedule))
         .route("/api/channels", get(get_channels))
         .route("/api/ops/alerts", get(get_ops))
         .route("/api/ingest/nodes", get(get_nodes))
         .route("/api/chat/latest", get(get_chat_latest))
+        .route("/api/chat/activity", get(get_chat_activity))
+        .route("/api/chat/leaderboard", get(get_chat_leaderboard))
         .route("/api/chat/send", post(post_chat_send))
+        .route("/api/clip/create", post(post_clip_create))
         .route("/api/mediamtx/auth", post(mediamtx_auth))
         .route("/api/mediamtx/metrics", get(get_mediamtx_metrics))
         .route("/api/notifications", get(get_notifications))
@@ -501,6 +574,11 @@ async fn main() {
     let api_state = state_for_srt.clone();
     tokio::spawn(async move {
         run_mediamtx_poll(api_state, mediamtx_poll).await;
+    });
+
+    let thumb_state = state_for_srt.clone();
+    tokio::spawn(async move {
+        run_thumbnail_loop(thumb_state).await;
     });
 
     axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), router.with_state(state_for_srt))
@@ -583,6 +661,42 @@ async fn ensure_tables(pool: &MySqlPool) {
     .execute(pool)
     .await
     .expect("create viewer_register_tokens failed");
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS clips (
+          id VARCHAR(32) PRIMARY KEY,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          created_by VARCHAR(64) NOT NULL,
+          length_secs INT NOT NULL,
+          status VARCHAR(16) NOT NULL,
+          url VARCHAR(255) NOT NULL,
+          error TEXT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("create clips failed");
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS stream_stats_history (
+          id BIGINT PRIMARY KEY AUTO_INCREMENT,
+          ts BIGINT NOT NULL,
+          viewer_count INT NULL,
+          bitrate_kbps INT NULL,
+          fps INT NULL,
+          latency_e2e_ms INT NULL,
+          latency_publish_ms INT NULL,
+          latency_playback_ms INT NULL,
+          INDEX idx_stream_stats_ts (ts)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("create stream_stats_history failed");
 }
 
 async fn ensure_defaults(pool: &MySqlPool) {
@@ -634,11 +748,17 @@ fn default_kv() -> Vec<(String, Value)> {
         "latency": "2.3s",
         "pushLatency": "0.8s",
         "playoutDelay": "420ms",
+        "latencyE2eMs": 0,
+        "publishLatencyMs": 0,
+        "playbackLatencyMs": 0,
         "fps": "60 fps",
+        "fpsValue": 60,
         "chatRate": "132 / min",
         "giftResponse": "98.2%",
         "giftLatency": "0.4s",
         "viewers": 12842,
+        "startedAt": 0,
+        "endedAt": 0,
         "updatedAt": now_iso()
     });
 
@@ -725,6 +845,95 @@ fn default_kv() -> Vec<(String, Value)> {
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn now_ts() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn parse_number(input: &str) -> Option<f64> {
+    let mut buf = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            buf.push(ch);
+        } else if !buf.is_empty() {
+            break;
+        }
+    }
+    buf.parse::<f64>().ok()
+}
+
+fn parse_duration_ms(input: &str) -> Option<i64> {
+    let trimmed = input.trim().to_lowercase();
+    if trimmed.ends_with("ms") {
+        return parse_number(&trimmed).map(|v| v.round() as i64);
+    }
+    if trimmed.ends_with('s') {
+        return parse_number(&trimmed).map(|v| (v * 1000.0) as i64);
+    }
+    parse_number(&trimmed).map(|v| v.round() as i64)
+}
+
+fn read_latency_ms(stream: &Value, numeric_key: &str, fallback_key: &str) -> i64 {
+    if let Some(value) = stream.get(numeric_key).and_then(|v| v.as_i64()) {
+        return value;
+    }
+    if let Some(raw) = stream.get(fallback_key).and_then(|v| v.as_str()) {
+        return parse_duration_ms(raw).unwrap_or(0);
+    }
+    0
+}
+
+fn chat_level(count: i64) -> u32 {
+    if count >= 1000 {
+        4
+    } else if count >= 200 {
+        3
+    } else if count >= 50 {
+        2
+    } else if count >= 10 {
+        1
+    } else {
+        0
+    }
+}
+
+fn chat_heat(count_10s: i64) -> &'static str {
+    if count_10s >= 30 {
+        "High"
+    } else if count_10s >= 10 {
+        "Medium"
+    } else {
+        "Low"
+    }
+}
+
+fn replace_chat_emojis(input: &str) -> String {
+    let mut out = input.to_string();
+    let replacements = [
+        (":cat:", "🐱"),
+        (":awawa:", "🥺"),
+        (":thonk:", "🤔"),
+    ];
+    for (key, value) in replacements {
+        out = out.replace(key, value);
+    }
+    out
+}
+
+fn parse_schedule_start(item: &Value) -> Option<i64> {
+    if let Some(ts) = item.get("startsAt").and_then(|v| v.as_i64()) {
+        return Some(ts);
+    }
+    if let Some(raw) = item.get("startsAt").and_then(|v| v.as_str()) {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+            return Some(dt.timestamp());
+        }
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
+            return Some(chrono::Utc.from_utc_datetime(&dt).timestamp());
+        }
+    }
+    None
 }
 
 fn default_notify_templates() -> Value {
@@ -862,13 +1071,6 @@ async fn resolve_viewer_anti_abuse_config(
         cfg.register_token_ttl_secs = value.clamp(60, 3600);
     }
     cfg
-}
-
-fn now_ts() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 fn client_ip(headers: &HeaderMap) -> Option<String> {
@@ -1013,6 +1215,7 @@ async fn get_stream_play(
     let read = ensure_read_token(&state).await;
     let webrtc_base = public_media_base(&state.mediamtx_webrtc, &headers);
     let hls_base = public_media_base(&state.mediamtx_hls, &headers);
+    let ll_hls = state.mediamtx_ll_hls.as_ref().map(|base| public_media_base(base, &headers));
     let whep = format!(
         "{}/{}/whep?token={}",
         webrtc_base.trim_end_matches('/'),
@@ -1025,10 +1228,46 @@ async fn get_stream_play(
         state.mediamtx_path,
         read
     );
+    let ll_hls_url = ll_hls.map(|base| {
+        format!(
+            "{}/{}/index.m3u8?token={}",
+            base.trim_end_matches('/'),
+            state.mediamtx_path,
+            read
+        )
+    });
+    let mut modes = vec!["whep"];
+    if ll_hls_url.is_some() {
+        modes.push("ll-hls");
+    }
+    modes.push("hls");
     Json(json!({
         "whep": whep,
+        "llHls": ll_hls_url,
         "hls": hls,
-        "token": read
+        "token": read,
+        "modes": modes
+    }))
+}
+
+async fn get_stream_replay(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    let read = ensure_read_token(&state).await;
+    let hls_base = public_media_base(&state.mediamtx_hls, &headers);
+    let hls = format!(
+        "{}/{}/index.m3u8?token={}",
+        hls_base.trim_end_matches('/'),
+        state.mediamtx_path,
+        read
+    );
+    let max_seconds = (state.hls_segment_duration_secs * state.hls_segment_count)
+        .min(state.replay_max_seconds);
+    Json(json!({
+        "enabled": true,
+        "maxSeconds": max_seconds,
+        "segmentDurationSecs": state.hls_segment_duration_secs,
+        "segmentCount": state.hls_segment_count,
+        "rewindSteps": [10, 30, 60],
+        "hls": hls
     }))
 }
 
@@ -1101,6 +1340,146 @@ async fn get_schedule(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({ "updatedAt": now_iso(), "items": schedule }))
 }
 
+async fn get_live_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
+    let status = stream
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("offline");
+    let live = matches!(status, "live" | "ready");
+    let viewer_count = stream
+        .get("viewers")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        .round() as i64;
+    let resolution = stream.get("resolution").and_then(|v| v.as_str()).unwrap_or("-");
+    let fps = stream
+        .get("fps")
+        .and_then(|v| v.as_str())
+        .and_then(parse_number)
+        .map(|v| v.round() as i64)
+        .unwrap_or(0);
+    let bitrate = stream
+        .get("bitrate")
+        .and_then(|v| v.as_str())
+        .and_then(parse_number)
+        .map(|v| (v * 1000.0) as i64)
+        .unwrap_or(0);
+    let latency = json!({
+        "end_to_end": read_latency_ms(&stream, "latencyE2eMs", "latency"),
+        "publish": read_latency_ms(&stream, "publishLatencyMs", "pushLatency"),
+        "playback": read_latency_ms(&stream, "playbackLatencyMs", "playoutDelay"),
+    });
+    let started_at = stream.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    Json(json!({
+        "live": live,
+        "title": stream.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+        "viewer_count": viewer_count,
+        "resolution": resolution,
+        "fps": fps,
+        "bitrate": bitrate,
+        "latency": latency,
+        "started_at": started_at
+    }))
+}
+
+async fn get_live_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
+    let status = stream
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("offline");
+    let live = matches!(status, "live" | "ready");
+    let started_at = stream.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    let latency = json!({
+        "end_to_end": read_latency_ms(&stream, "latencyE2eMs", "latency"),
+        "publish": read_latency_ms(&stream, "publishLatencyMs", "pushLatency"),
+        "playback": read_latency_ms(&stream, "playbackLatencyMs", "playoutDelay"),
+    });
+    Json(json!({
+        "live": live,
+        "title": stream.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+        "viewer_count": stream.get("viewers").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i64,
+        "resolution": stream.get("resolution").and_then(|v| v.as_str()).unwrap_or("-"),
+        "fps": stream.get("fps").and_then(|v| v.as_str()).and_then(parse_number).map(|v| v.round() as i64).unwrap_or(0),
+        "bitrate": stream.get("bitrate").and_then(|v| v.as_str()).and_then(parse_number).map(|v| (v * 1000.0) as i64).unwrap_or(0),
+        "latency": latency,
+        "started_at": started_at
+    }))
+}
+
+async fn get_live_history(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<HistoryQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(240).min(1000);
+    let since = query.since.unwrap_or(0);
+    let rows = sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>)>(
+        r#"
+        SELECT ts, viewer_count, bitrate_kbps, fps, latency_e2e_ms, latency_publish_ms, latency_playback_ms
+        FROM stream_stats_history
+        WHERE ts >= ?
+        ORDER BY ts DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(since)
+    .bind(limit as i64)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "ts": row.0,
+                "viewer_count": row.1.unwrap_or(0),
+                "bitrate": row.2.unwrap_or(0),
+                "fps": row.3.unwrap_or(0),
+                "latency": {
+                    "end_to_end": row.4.unwrap_or(0),
+                    "publish": row.5.unwrap_or(0),
+                    "playback": row.6.unwrap_or(0),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Json(json!({ "updatedAt": now_iso(), "items": items }))
+}
+
+async fn get_live_countdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let schedule = get_json(&state.pool, "schedule", default_kv()[4].1.clone()).await;
+    let now = chrono::Utc::now().timestamp();
+    let mut next_item: Option<(i64, Value)> = None;
+    if let Some(items) = schedule.as_array() {
+        for item in items {
+            let starts_at = parse_schedule_start(item);
+            if let Some(ts) = starts_at {
+                if ts > now {
+                    if next_item.as_ref().map(|(cur, _)| ts < *cur).unwrap_or(true) {
+                        next_item = Some((ts, item.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((ts, item)) = next_item {
+        let remaining = (ts - now).max(0);
+        Json(json!({
+            "next": {
+                "startsAt": ts,
+                "title": item.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                "host": item.get("host").and_then(|v| v.as_str()).unwrap_or(""),
+            },
+            "remainingSecs": remaining
+        }))
+    } else {
+        Json(json!({ "next": null, "remainingSecs": 0 }))
+    }
+}
+
 async fn get_notifications(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let items = get_json(&state.pool, "notifications", json!([])).await;
     Json(json!({ "updatedAt": now_iso(), "items": items }))
@@ -1122,11 +1501,16 @@ async fn get_nodes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn get_chat_latest(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let rows = sqlx::query_as::<_, ChatMessage>(
+    let rows = sqlx::query_as::<_, ChatMessageRow>(
         r#"
-        SELECT id, user, text, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at
-        FROM chat_messages
-        ORDER BY id DESC
+        SELECT
+            cm.id,
+            cm.user,
+            cm.text,
+            DATE_FORMAT(cm.created_at, '%Y-%m-%d %H:%i:%s') as created_at,
+            (SELECT COUNT(*) FROM chat_messages cm2 WHERE cm2.user = cm.user AND cm2.id <= cm.id) as msg_count
+        FROM chat_messages cm
+        ORDER BY cm.id DESC
         LIMIT 50
         "#,
     )
@@ -1134,7 +1518,77 @@ async fn get_chat_latest(State(state): State<Arc<AppState>>) -> impl IntoRespons
     .await
     .unwrap_or_default();
 
-    Json(json!({ "items": rows.into_iter().rev().collect::<Vec<_>>() }))
+    let items = rows
+        .into_iter()
+        .rev()
+        .map(|row| {
+            let level = chat_level(row.msg_count);
+            ChatMessage {
+                id: row.id,
+                user: row.user,
+                text: row.text,
+                created_at: row.created_at,
+                msg_count: row.msg_count,
+                level,
+                level_label: format!("Lv{level}"),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Json(json!({ "items": items }))
+}
+
+async fn get_chat_activity(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let count_10s = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM chat_messages WHERE created_at >= (NOW() - INTERVAL 10 SECOND)"
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    let heat = chat_heat(count_10s);
+    Json(json!({
+        "per10s": count_10s,
+        "heat": heat
+    }))
+}
+
+async fn get_chat_leaderboard(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<LeaderboardQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(10).min(100);
+    let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
+    let started_at = stream.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    let rows = sqlx::query_as::<_, (String, i64, i64)>(
+        r#"
+        SELECT user,
+               COUNT(*) AS total_count,
+               SUM(created_at >= FROM_UNIXTIME(?)) AS live_count
+        FROM chat_messages
+        GROUP BY user
+        ORDER BY total_count DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(started_at)
+    .bind(limit as i64)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let items = rows
+        .into_iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            json!({
+                "rank": (idx + 1) as i64,
+                "user": row.0,
+                "messages": row.1,
+                "messages_live": row.2
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({ "items": items }))
 }
 
 async fn post_chat_send(
@@ -1153,7 +1607,9 @@ async fn post_chat_send(
     let user = viewer;
 
     let user = user.chars().take(24).collect::<String>();
-    let text = text.chars().take(120).collect::<String>();
+    let mut text = text.chars().take(160).collect::<String>();
+    text = replace_chat_emojis(&text);
+    let text = text.chars().take(200).collect::<String>();
     if !state.chat_filter_words.is_empty() {
         let lowered = text.to_lowercase();
         if state.chat_filter_words.iter().any(|word| lowered.contains(word)) {
@@ -1173,14 +1629,38 @@ async fn post_chat_send(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "db" })));
     }
 
+    let msg_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM chat_messages WHERE user = ?"
+    )
+    .bind(&user)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    let level = chat_level(msg_count);
     let msg = ChatMessage {
         id: result.unwrap().last_insert_id() as i64,
         user,
         text,
         created_at: now_iso(),
+        msg_count,
+        level,
+        level_label: format!("Lv{level}"),
     };
 
     broadcast(&state, "chat:new", &json!(msg));
+
+    if let Ok(count_10s) = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM chat_messages WHERE created_at >= (NOW() - INTERVAL 10 SECOND)"
+    )
+    .fetch_one(&state.pool)
+    .await
+    {
+        let heat = chat_heat(count_10s);
+        broadcast(&state, "chat:activity", &json!({
+            "per10s": count_10s,
+            "heat": heat
+        }));
+    }
 
     if let Ok(count) = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM chat_messages WHERE created_at >= (NOW() - INTERVAL 60 SECOND)"
@@ -1195,6 +1675,75 @@ async fn post_chat_send(
     (StatusCode::OK, Json(json!({ "ok": true, "item": msg })))
 }
 
+async fn post_clip_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ClipCreatePayload>,
+) -> impl IntoResponse {
+    let Some(viewer) = viewer_from_header(&headers, &state).await else {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "login_required" })));
+    };
+    let length_secs = payload.length_secs.unwrap_or(20);
+    if length_secs < state.clip_min_secs || length_secs > state.clip_max_secs {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "length_invalid", "min": state.clip_min_secs, "max": state.clip_max_secs })),
+        );
+    }
+    let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
+    let status = stream.get("status").and_then(|v| v.as_str()).unwrap_or("offline");
+    if status != "live" && status != "ready" {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "stream_offline" })));
+    }
+
+    let clip_id = format!("clip_{:x}", rand_u64());
+    let clip_url = format!("/clips/{clip_id}.mp4");
+    let public_url = public_url(&state, &clip_url);
+
+    let insert = sqlx::query(
+        r#"
+        INSERT INTO clips (id, created_by, length_secs, status, url)
+        VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&clip_id)
+    .bind(&viewer)
+    .bind(length_secs as i64)
+    .bind("processing")
+    .bind(&clip_url)
+    .execute(&state.pool)
+    .await;
+
+    if insert.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "db" })));
+    }
+
+    let task_state = state.clone();
+    let clip_id_task = clip_id.clone();
+    tokio::spawn(async move {
+        let result = build_clip_from_hls(&task_state, &clip_id_task, length_secs).await;
+        if let Err(err) = result {
+            let _ = sqlx::query("UPDATE clips SET status = ?, error = ? WHERE id = ?")
+                .bind("failed")
+                .bind(err)
+                .bind(&clip_id_task)
+                .execute(&task_state.pool)
+                .await;
+        } else {
+            let _ = sqlx::query("UPDATE clips SET status = ? WHERE id = ?")
+                .bind("ready")
+                .bind(&clip_id_task)
+                .execute(&task_state.pool)
+                .await;
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(json!({ "clip_id": clip_id, "clip_url": public_url })),
+    )
+}
+
 async fn post_stream_telemetry(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<TelemetryPayload>,
@@ -1203,16 +1752,19 @@ async fn post_stream_telemetry(
     if let Some(ms) = payload.e2e_latency_ms {
         if let Some(obj) = patch.as_object_mut() {
             obj.insert("latency".to_string(), json!(format!("{:.0}ms", ms)));
+            obj.insert("latencyE2eMs".to_string(), json!(ms.round() as i64));
         }
     }
     if let Some(ms) = payload.playout_delay_ms {
         if let Some(obj) = patch.as_object_mut() {
             obj.insert("playoutDelay".to_string(), json!(format!("{:.0}ms", ms)));
+            obj.insert("playbackLatencyMs".to_string(), json!(ms.round() as i64));
         }
     }
     if let Some(ms) = payload.push_latency_ms {
         if let Some(obj) = patch.as_object_mut() {
             obj.insert("pushLatency".to_string(), json!(format!("{:.0}ms", ms)));
+            obj.insert("publishLatencyMs".to_string(), json!(ms.round() as i64));
         }
     }
     if let Some(fps) = payload.fps {
@@ -1223,6 +1775,7 @@ async fn post_stream_telemetry(
                 "-".to_string()
             };
             obj.insert("fps".to_string(), json!(value));
+            obj.insert("fpsValue".to_string(), json!(fps.round() as i64));
         }
     }
     if patch.as_object().map(|obj| obj.is_empty()).unwrap_or(true) {
@@ -1230,6 +1783,234 @@ async fn post_stream_telemetry(
     }
     update_stream_patch(&state, &patch).await;
     (StatusCode::OK, Json(json!({ "ok": true })))
+}
+
+async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: u64) -> Result<(), String> {
+    let read = ensure_read_token(state).await;
+    let playlist_url = format!(
+        "{}/{}/index.m3u8?token={}",
+        state.mediamtx_hls.trim_end_matches('/'),
+        state.mediamtx_path,
+        read
+    );
+    let client = Client::new();
+    let playlist = client
+        .get(&playlist_url)
+        .send()
+        .await
+        .map_err(|_| "playlist_fetch_failed".to_string())?
+        .text()
+        .await
+        .map_err(|_| "playlist_read_failed".to_string())?;
+
+    let segments = parse_hls_segments(&playlist, &playlist_url, &read);
+    if segments.is_empty() {
+        return Err("no_segments".to_string());
+    }
+    let selected = select_hls_segments(&segments, length_secs as f64);
+    if selected.is_empty() {
+        return Err("segment_select_failed".to_string());
+    }
+
+    let tmp_root = PathBuf::from("resources/clip_tmp").join(clip_id);
+    fs::create_dir_all(&tmp_root)
+        .await
+        .map_err(|_| "tmp_dir_failed".to_string())?;
+
+    let mut list_lines = Vec::new();
+    for (idx, seg) in selected.iter().enumerate() {
+        let path = tmp_root.join(format!("seg_{idx}.ts"));
+        let bytes = client
+            .get(&seg.url)
+            .send()
+            .await
+            .map_err(|_| "segment_fetch_failed".to_string())?
+            .bytes()
+            .await
+            .map_err(|_| "segment_read_failed".to_string())?;
+        fs::write(&path, bytes)
+            .await
+            .map_err(|_| "segment_write_failed".to_string())?;
+        let line = format!("file '{}'", path.to_string_lossy().replace('\\', "/"));
+        list_lines.push(line);
+    }
+    let concat_path = tmp_root.join("concat.txt");
+    fs::write(&concat_path, list_lines.join("\n"))
+        .await
+        .map_err(|_| "concat_write_failed".to_string())?;
+
+    let output_dir = PathBuf::from(&state.clip_dir);
+    fs::create_dir_all(&output_dir)
+        .await
+        .map_err(|_| "clip_dir_failed".to_string())?;
+    let output_path = output_dir.join(format!("{clip_id}.mp4"));
+    let concat_path_str = concat_path.to_string_lossy().to_string();
+    let output_path_str = output_path.to_string_lossy().to_string();
+    let args = vec![
+        "-y".to_string(),
+        "-f".to_string(),
+        "concat".to_string(),
+        "-safe".to_string(),
+        "0".to_string(),
+        "-i".to_string(),
+        concat_path_str,
+        "-c".to_string(),
+        "copy".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        output_path_str,
+    ];
+    run_ffmpeg(&state.ffmpeg_bin, &args).await?;
+
+    let _ = fs::remove_dir_all(&tmp_root).await;
+    Ok(())
+}
+
+struct HlsSegment {
+    url: String,
+    duration: f64,
+}
+
+fn parse_hls_segments(playlist: &str, playlist_url: &str, token: &str) -> Vec<HlsSegment> {
+    let base = playlist_base(playlist_url);
+    let origin = playlist_origin(playlist_url);
+    let mut segments = Vec::new();
+    let mut current_duration: Option<f64> = None;
+    for line in playlist.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#EXTINF:") {
+            let value = trimmed.trim_start_matches("#EXTINF:");
+            let duration = value.split(',').next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+            current_duration = Some(duration);
+            continue;
+        }
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        let mut url = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            trimmed.to_string()
+        } else if trimmed.starts_with('/') {
+            format!("{origin}{trimmed}")
+        } else {
+            format!("{base}/{trimmed}")
+        };
+        url = append_token(&url, token);
+        segments.push(HlsSegment {
+            url,
+            duration: current_duration.unwrap_or(0.0).max(0.1),
+        });
+        current_duration = None;
+    }
+    segments
+}
+
+fn select_hls_segments(segments: &[HlsSegment], target_secs: f64) -> Vec<HlsSegment> {
+    let mut acc = 0.0;
+    let mut picked = Vec::new();
+    for seg in segments.iter().rev() {
+        acc += seg.duration;
+        picked.push(HlsSegment {
+            url: seg.url.clone(),
+            duration: seg.duration,
+        });
+        if acc >= target_secs {
+            break;
+        }
+    }
+    picked.reverse();
+    picked
+}
+
+fn playlist_base(url: &str) -> String {
+    let no_query = url.split('?').next().unwrap_or(url);
+    if let Some(pos) = no_query.rfind('/') {
+        no_query[..pos].to_string()
+    } else {
+        no_query.to_string()
+    }
+}
+
+fn playlist_origin(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+    let host = rest.split('/').next().unwrap_or(rest);
+    format!("{scheme}://{host}")
+}
+
+fn append_token(url: &str, token: &str) -> String {
+    if url.contains("token=") {
+        url.to_string()
+    } else if url.contains('?') {
+        format!("{url}&token={token}")
+    } else {
+        format!("{url}?token={token}")
+    }
+}
+
+async fn run_ffmpeg(bin: &str, args: &[String]) -> Result<(), String> {
+    let mut cmd = Command::new(bin);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let status = cmd.status().await.map_err(|_| "ffmpeg_start_failed".to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("ffmpeg_failed".to_string())
+    }
+}
+
+fn public_url(state: &AppState, path: &str) -> String {
+    if state.public_base_url.trim().is_empty() {
+        path.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            state.public_base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
+    }
+}
+
+async fn run_thumbnail_loop(state: Arc<AppState>) {
+    let mut ticker = tokio::time::interval(state.thumbnail_interval);
+    loop {
+        ticker.tick().await;
+        let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
+        let status = stream.get("status").and_then(|v| v.as_str()).unwrap_or("offline");
+        if status != "live" && status != "ready" {
+            continue;
+        }
+        let source = if let Some(src) = state.thumbnail_source.as_ref() {
+            src.clone()
+        } else {
+            let read = ensure_read_token(&state).await;
+            format!(
+                "{}/{}/index.m3u8?token={}",
+                state.mediamtx_hls.trim_end_matches('/'),
+                state.mediamtx_path,
+                read
+            )
+        };
+        let output_dir = PathBuf::from("public/live");
+        if fs::create_dir_all(&output_dir).await.is_err() {
+            continue;
+        }
+        let output_tmp = output_dir.join("cover.tmp.jpg");
+        let output_path = output_dir.join("cover.jpg");
+        let args = vec![
+            "-y".to_string(),
+            "-i".to_string(),
+            source,
+            "-frames:v".to_string(),
+            "1".to_string(),
+            "-q:v".to_string(),
+            "2".to_string(),
+            output_tmp.to_string_lossy().to_string(),
+        ];
+        if run_ffmpeg(&state.ffmpeg_bin, &args).await.is_ok() {
+            let _ = fs::rename(&output_tmp, &output_path).await;
+        }
+    }
 }
 
 async fn mediamtx_auth(
@@ -2304,6 +3085,38 @@ async fn ws_handler(
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx = state.broadcaster.subscribe();
+    let chat_rows = sqlx::query_as::<_, ChatMessageRow>(
+        r#"
+        SELECT
+            cm.id,
+            cm.user,
+            cm.text,
+            DATE_FORMAT(cm.created_at, '%Y-%m-%d %H:%i:%s') as created_at,
+            (SELECT COUNT(*) FROM chat_messages cm2 WHERE cm2.user = cm.user AND cm2.id <= cm.id) as msg_count
+        FROM chat_messages cm
+        ORDER BY cm.id DESC
+        LIMIT 50
+        "#
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+    let chat_items = chat_rows
+        .into_iter()
+        .rev()
+        .map(|row| {
+            let level = chat_level(row.msg_count);
+            ChatMessage {
+                id: row.id,
+                user: row.user,
+                text: row.text,
+                created_at: row.created_at,
+                msg_count: row.msg_count,
+                level,
+                level_label: format!("Lv{level}"),
+            }
+        })
+        .collect::<Vec<_>>();
     let snapshot = json!({
         "stream": get_json(&state.pool, "stream", default_kv()[0].1.clone()).await,
         "stats": get_json(&state.pool, "stats", default_kv()[1].1.clone()).await,
@@ -2315,20 +3128,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         "nodes": get_json(&state.pool, "nodes", default_kv()[7].1.clone()).await,
         "notifications": get_json(&state.pool, "notifications", json!([])).await,
         "chat": {
-            "items": sqlx::query_as::<_, ChatMessage>(
-                r#"
-                SELECT id, user, text, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at
-                FROM chat_messages
-                ORDER BY id DESC
-                LIMIT 50
-                "#
-            )
-            .fetch_all(&state.pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
+            "items": chat_items
         }
     });
 
@@ -2739,13 +3539,75 @@ async fn update_stream_patch(state: &AppState, patch: &Value) {
         .to_string();
     if previous_status != next_status {
         if next_status == "live" {
+            if let Some(obj) = current.as_object_mut() {
+                obj.insert("startedAt".to_string(), json!(now_ts()));
+            }
             push_notification(state, "live", "主播已开播", "直播间正在进行中").await;
         } else if previous_status == "live" {
+            if let Some(obj) = current.as_object_mut() {
+                obj.insert("endedAt".to_string(), json!(now_ts()));
+            }
             push_notification(state, "offline", "主播已下播", "直播已结束").await;
         }
     }
+    record_stream_stats_if_due(state, &current).await;
     set_json(&state.pool, "stream", &current).await;
     broadcast(state, "stream:update", &current);
+}
+
+async fn record_stream_stats_if_due(state: &AppState, stream: &Value) {
+    let status = stream.get("status").and_then(|v| v.as_str()).unwrap_or("offline");
+    if status != "live" && status != "ready" {
+        return;
+    }
+    let mut last = state.stats_last_written.write().await;
+    if last.elapsed() < Duration::from_secs(5) {
+        return;
+    }
+    *last = Instant::now();
+
+    let viewer_count = stream
+        .get("viewers")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        .round() as i64;
+    let bitrate_kbps = stream
+        .get("bitrate")
+        .and_then(|v| v.as_str())
+        .and_then(parse_number)
+        .map(|v| (v * 1000.0) as i64)
+        .unwrap_or(0);
+    let fps = stream
+        .get("fpsValue")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            stream.get("fps")
+                .and_then(|v| v.as_str())
+                .and_then(parse_number)
+                .map(|v| v.round() as i64)
+        })
+        .unwrap_or(0);
+    let latency_e2e = read_latency_ms(stream, "latencyE2eMs", "latency");
+    let latency_publish = read_latency_ms(stream, "publishLatencyMs", "pushLatency");
+    let latency_playback = read_latency_ms(stream, "playbackLatencyMs", "playoutDelay");
+    let ts = now_ts();
+
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO stream_stats_history
+            (ts, viewer_count, bitrate_kbps, fps, latency_e2e_ms, latency_publish_ms, latency_playback_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(ts)
+    .bind(viewer_count)
+    .bind(bitrate_kbps)
+    .bind(fps)
+    .bind(latency_e2e)
+    .bind(latency_publish)
+    .bind(latency_playback)
+    .execute(&state.pool)
+    .await;
 }
 
 fn unwrap_items(payload: &Value) -> Value {
@@ -3196,13 +4058,8 @@ impl Drop for StreamGuard {
 }
 
 async fn update_stream_status(state: &AppState, status: &str) {
-    let mut current = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
-    if let Some(obj) = current.as_object_mut() {
-        obj.insert("status".to_string(), json!(status));
-        obj.insert("updatedAt".to_string(), json!(now_iso()));
-    }
-    set_json(&state.pool, "stream", &current).await;
-    broadcast(state, "stream:update", &current);
+    let patch = json!({ "status": status });
+    update_stream_patch(state, &patch).await;
 }
 
 async fn update_stream_metric(state: &AppState, key: &str, value: Value) {
@@ -3239,6 +4096,9 @@ async fn update_stream_fields(
     if let Some(push_latency) = push_latency {
         if let Some(obj) = patch.as_object_mut() {
             obj.insert("pushLatency".to_string(), json!(push_latency));
+            if let Some(ms) = parse_duration_ms(&push_latency) {
+                obj.insert("publishLatencyMs".to_string(), json!(ms));
+            }
         }
     }
     update_stream_patch(state, &patch).await;

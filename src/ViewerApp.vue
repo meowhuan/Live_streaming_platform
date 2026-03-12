@@ -78,7 +78,7 @@ const chatRateLocal = computed(() => {
   return `${count} / min`;
 });
 
-const playInfo = ref({ whep: "", hls: "" });
+const playInfo = ref({ whep: "", llHls: "", hls: "", modes: [] });
 const playerError = ref("");
 const streamUnavailable = computed(() => {
   const message = playerError.value || "";
@@ -86,6 +86,7 @@ const streamUnavailable = computed(() => {
 });
 const playerStatus = ref("idle");
 const videoRef = ref(null);
+const videoFrameRef = ref(null);
 let fpsFrameCount = 0;
 let fpsWindowStart = 0;
 let fpsHandle = 0;
@@ -96,11 +97,30 @@ let statsTimer = null;
 let resizeObserver = null;
 let collapseMedia = null;
 let collapseListener = null;
+let leaderboardTimer = null;
+let activityTimer = null;
+let drawerRaf = 0;
+const drawerStyle = ref({ top: "0px", right: "0px" });
 const overlayTab = ref("schedule");
 const isCollapsed = ref(false);
 const chatAtBottom = ref(true);
 const chatHasNew = ref(false);
 const isMobile = ref(false);
+const selectedMode = ref(localStorage.getItem("playback_mode") || "auto");
+const activeMode = ref("auto");
+const replayInfo = ref({ enabled: false, maxSeconds: 0, rewindSteps: [10, 30, 60], hls: "" });
+const clipCreating = ref(false);
+const clipNotice = ref("");
+const lastClipUrl = ref("");
+const chatActivity = ref({ per10s: 0, heat: "Low" });
+const leaderboard = ref([]);
+const countdown = ref({ next: null, remainingSecs: 0 });
+let countdownTimer = null;
+const showMobileControls = ref(false);
+const replayExpanded = ref(false);
+const showMobileDrawer = ref(false);
+const showUnmutePrompt = ref(false);
+const unmuteTried = ref(false);
 
 const normalizePlayUrl = (raw) => {
   if (!raw) return raw;
@@ -152,6 +172,15 @@ const highlightMentions = (text) => {
   return escaped.replace(/@([^\s@]{1,20})/g, "<span class=\"chat-mention\">@$1</span>");
 };
 
+const appendEmoji = (code) => {
+  if (!viewerAuthed.value) {
+    showViewerAuth.value = true;
+    return;
+  }
+  chatText.value = `${chatText.value}${chatText.value ? " " : ""}${code} `;
+  nextTick(() => {});
+};
+
 
 const reportWhepStats = async () => {
   if (!pc || pc.connectionState === "closed") return;
@@ -200,6 +229,40 @@ const reportWhepStats = async () => {
   } catch {
     // ignore
   }
+};
+
+const modeLabels = {
+  auto: "智能",
+  whep: "超低延迟",
+  "ll-hls": "低延迟",
+  hls: "稳定"
+};
+
+const availableModes = computed(() => {
+  const modes = playInfo.value?.modes?.length ? playInfo.value.modes : [];
+  if (!modes.length) {
+    const fallback = [];
+    if (playInfo.value.whep) fallback.push("whep");
+    if (playInfo.value.llHls) fallback.push("ll-hls");
+    if (playInfo.value.hls) fallback.push("hls");
+    return fallback;
+  }
+  return modes;
+});
+
+const modeOptions = computed(() => ["auto", ...availableModes.value]);
+
+const countdownText = computed(() => {
+  if (!countdown.value?.next || countdown.value.remainingSecs <= 0) return "暂无排期";
+  return `开播倒计时 ${formatDuration(countdown.value.remainingSecs)}`;
+});
+
+const formatDuration = (totalSecs) => {
+  const secs = Math.max(0, Math.floor(totalSecs));
+  const hours = String(Math.floor(secs / 3600)).padStart(2, "0");
+  const minutes = String(Math.floor((secs % 3600) / 60)).padStart(2, "0");
+  const seconds = String(secs % 60).padStart(2, "0");
+  return `${hours}:${minutes}:${seconds}`;
 };
 
 const startVideoFps = () => {
@@ -264,26 +327,52 @@ const loadAll = async () => {
     chatMessages.value = (chatRes.items || []).map(normalizeChatMessage);
     notifications.value = notifyRes.items || [];
     playerError.value = "";
-    let playRes = null;
-    try {
-      playRes = await fetchJson("/api/stream/play");
-    } catch {
-      playRes = null;
-    }
+    const extraResults = await Promise.allSettled([
+      fetchJson("/api/stream/play"),
+      fetchJson("/api/stream/replay"),
+      fetchJson("/api/chat/activity"),
+      fetchJson("/api/chat/leaderboard"),
+      fetchJson("/api/live/countdown")
+    ]);
+    const [playRes, replayRes, activityRes, leaderboardRes, countdownRes] = extraResults.map((r) =>
+      r.status === "fulfilled" ? r.value : null
+    );
     const normalized = {
       whep: normalizePlayUrl(playRes?.whep || ""),
-      hls: normalizePlayUrl(playRes?.hls || "")
+      llHls: normalizePlayUrl(playRes?.llHls || ""),
+      hls: normalizePlayUrl(playRes?.hls || ""),
+      modes: playRes?.modes || []
     };
     playInfo.value = normalized;
-    if (!playInfo.value.whep && !playInfo.value.hls) {
-      playerError.value = "未开播";
-      playerStatus.value = "idle";
-    } else if (playInfo.value.whep && playerStatus.value === "idle") {
-      startWhep(playInfo.value.whep).catch((err) => {
-        playerError.value = err instanceof Error ? err.message : "播放器错误";
-        playerStatus.value = "error";
-      });
+    if (replayRes) {
+      replayInfo.value = {
+        enabled: !!replayRes.enabled,
+        maxSeconds: replayRes.maxSeconds || 0,
+        rewindSteps: replayRes.rewindSteps || [10, 30, 60],
+        hls: normalizePlayUrl(replayRes.hls || "")
+      };
     }
+    if (activityRes) {
+      chatActivity.value = {
+        per10s: activityRes.per10s || 0,
+        heat: activityRes.heat || "Low"
+      };
+    }
+    if (leaderboardRes?.items) {
+      leaderboard.value = leaderboardRes.items || [];
+    }
+    if (countdownRes) {
+      countdown.value = {
+        next: countdownRes.next || null,
+        remainingSecs: countdownRes.remainingSecs || 0
+      };
+    }
+    const mode = selectedMode.value;
+    if (mode !== "auto" && !availableModes.value.includes(mode)) {
+      selectedMode.value = "auto";
+      localStorage.setItem("playback_mode", "auto");
+    }
+    await startPlaybackFromMode();
   } catch (err) {
     error.value = err instanceof Error ? err.message : "加载失败";
   } finally {
@@ -317,6 +406,12 @@ const applyUpdate = (type, data) => {
       break;
     case "chat:new":
       chatMessages.value = [...chatMessages.value, normalizeChatMessage(data)].slice(-200);
+      break;
+    case "chat:activity":
+      chatActivity.value = {
+        per10s: data?.per10s || 0,
+        heat: data?.heat || "Low"
+      };
       break;
     case "notify:new":
       notifications.value = [...notifications.value, data].slice(-50);
@@ -370,6 +465,34 @@ const connectWs = () => {
       connectWs();
     }, 3000);
   };
+};
+
+const startCountdownTimer = () => {
+  if (countdownTimer) clearInterval(countdownTimer);
+  countdownTimer = setInterval(() => {
+    if (!countdown.value?.next) return;
+    if (countdown.value.remainingSecs > 0) {
+      countdown.value = {
+        ...countdown.value,
+        remainingSecs: Math.max(0, countdown.value.remainingSecs - 1)
+      };
+    }
+  }, 1000);
+};
+
+const updateDrawerPosition = () => {
+  if (!isMobile.value || !videoFrameRef.value) return;
+  const rect = videoFrameRef.value.getBoundingClientRect();
+  const minTop = Math.round(rect.top + 8);
+  const baseTop = Math.round(rect.bottom - 48);
+  const maxTop = window.innerHeight - 72;
+  const top = Math.min(Math.max(baseTop, minTop), maxTop);
+  drawerStyle.value = { top: `${top}px` };
+};
+
+const scheduleDrawerUpdate = () => {
+  if (drawerRaf) cancelAnimationFrame(drawerRaf);
+  drawerRaf = requestAnimationFrame(updateDrawerPosition);
 };
 
 const parseNumber = (value) => {
@@ -441,6 +564,42 @@ const sendChat = async () => {
     chatText.value = "";
   } finally {
     chatSending.value = false;
+  }
+};
+
+const createClip = async (lengthSecs) => {
+  if (!viewerAuthed.value) {
+    showViewerAuth.value = true;
+    return;
+  }
+  if (clipCreating.value) return;
+  clipCreating.value = true;
+  clipNotice.value = "";
+  lastClipUrl.value = "";
+  try {
+    const res = await fetch(apiUrl("/api/clip/create"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(viewerToken.value ? { authorization: `Bearer ${viewerToken.value}` } : {})
+      },
+      body: JSON.stringify({ lengthSecs })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || "剪辑创建失败");
+    }
+    lastClipUrl.value = data.clip_url || "";
+    clipNotice.value = "剪辑已开始生成";
+  } catch (err) {
+    clipNotice.value = err instanceof Error ? err.message : "剪辑创建失败";
+  } finally {
+    clipCreating.value = false;
+    if (clipNotice.value) {
+      setTimeout(() => {
+        clipNotice.value = "";
+      }, 3000);
+    }
   }
 };
 
@@ -733,18 +892,119 @@ const waitIceGathering = (peer) => new Promise((resolve) => {
   peer.addEventListener("icegatheringstatechange", check);
 });
 
-const startWhep = async (url) => {
-  if (!url) return;
-  playerError.value = "";
-  playerStatus.value = "connecting";
-  if (pc) {
-    pc.close();
-    pc = null;
-  }
+const supportsWhep = () => typeof RTCPeerConnection !== "undefined";
+
+const stopPlayback = () => {
   if (statsTimer) {
     clearInterval(statsTimer);
     statsTimer = null;
   }
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+  if (videoRef.value) {
+    videoRef.value.pause();
+    videoRef.value.srcObject = null;
+    if (videoRef.value.src) {
+      videoRef.value.removeAttribute("src");
+      videoRef.value.load();
+    }
+  }
+};
+
+const startHls = async (rawUrl, mode) => {
+  const url = normalizePlayUrl(rawUrl || "");
+  if (!url) {
+    playerStatus.value = "idle";
+    playerError.value = "未开播";
+    return false;
+  }
+  stopPlayback();
+  playerError.value = "";
+  playerStatus.value = "connecting";
+  if (videoRef.value) {
+    videoRef.value.srcObject = null;
+    videoRef.value.src = url;
+    try {
+      await videoRef.value.play();
+    } catch {
+      // autoplay may be blocked
+    }
+    showUnmutePrompt.value = videoRef.value.muted;
+  }
+  playerStatus.value = "playing";
+  activeMode.value = mode;
+  return true;
+};
+
+const requestUnmute = async () => {
+  if (!videoRef.value) return;
+  unmuteTried.value = true;
+  videoRef.value.muted = false;
+  try {
+    await videoRef.value.play();
+    showUnmutePrompt.value = false;
+  } catch {
+    showUnmutePrompt.value = true;
+  }
+};
+
+const startPlaybackFromMode = async () => {
+  if (!playInfo.value?.whep && !playInfo.value?.hls && !playInfo.value?.llHls) {
+    playerError.value = "未开播";
+    playerStatus.value = "idle";
+    return;
+  }
+  const mode = selectedMode.value;
+  if (mode === "auto") {
+    if (playInfo.value.whep && supportsWhep()) {
+      const ok = await startWhep(playInfo.value.whep);
+      if (ok) return;
+    }
+    if (playInfo.value.llHls) {
+      await startHls(playInfo.value.llHls, "ll-hls");
+      return;
+    }
+    if (playInfo.value.hls) {
+      await startHls(playInfo.value.hls, "hls");
+    }
+    return;
+  }
+  if (mode === "whep") {
+    if (!playInfo.value.whep || !supportsWhep()) {
+      playerError.value = "当前设备不支持 WHEP";
+      playerStatus.value = "error";
+      return;
+    }
+    await startWhep(playInfo.value.whep);
+    return;
+  }
+  if (mode === "ll-hls") {
+    await startHls(playInfo.value.llHls || playInfo.value.hls, "ll-hls");
+    return;
+  }
+  await startHls(playInfo.value.hls, "hls");
+};
+
+const rewindPlayback = (seconds) => {
+  const video = videoRef.value;
+  if (!video || !Number.isFinite(video.duration)) return;
+  const target = Math.max(0, video.duration - seconds);
+  video.currentTime = target;
+};
+
+const jumpLive = () => {
+  const video = videoRef.value;
+  if (!video || !Number.isFinite(video.duration)) return;
+  video.currentTime = video.duration;
+};
+
+const startWhep = async (url) => {
+  if (!url) return;
+  playerError.value = "";
+  playerStatus.value = "connecting";
+  stopPlayback();
 
   pc = new RTCPeerConnection();
   pc.addTransceiver("video", { direction: "recvonly" });
@@ -755,6 +1015,8 @@ const startWhep = async (url) => {
     if (videoRef.value && stream) {
       videoRef.value.srcObject = stream;
       startVideoFps();
+      videoRef.value.play().catch(() => {});
+      showUnmutePrompt.value = videoRef.value.muted;
     }
   };
 
@@ -771,8 +1033,8 @@ const startWhep = async (url) => {
     });
   } catch {
     playerStatus.value = "idle";
-    playerError.value = "未开播";
-    return;
+      playerError.value = "未开播";
+    return false;
   }
 
   if (!res.ok) {
@@ -780,22 +1042,24 @@ const startWhep = async (url) => {
     if (res.status === 404 && text.includes("no stream is available")) {
       playerStatus.value = "idle";
       playerError.value = "未开播";
-      return;
+      return false;
     }
     playerStatus.value = "error";
     playerError.value = `WHEP 连接失败 ${res.status}: ${text || "Bad Request"}`;
-    return;
+    return false;
   }
 
   const answerSdp = await res.text();
   if (!answerSdp) {
     playerStatus.value = "error";
     playerError.value = "WHEP 无返回 SDP";
-    return;
+    return false;
   }
   await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
   playerStatus.value = "playing";
+  activeMode.value = "whep";
   statsTimer = setInterval(reportWhepStats, 5000);
+  return true;
 };
 
 onMounted(() => {
@@ -804,6 +1068,10 @@ onMounted(() => {
   loadViewerMe();
   ensureTurnstileScript();
   setupMobileWatch();
+  startCountdownTimer();
+  nextTick(() => {
+    updateDrawerPosition();
+  });
   window.onViewerTurnstile = (token) => {
     viewerTurnstileToken.value = token;
   };
@@ -823,11 +1091,35 @@ onMounted(() => {
       loadAll();
     }
   }, 20000);
+  window.addEventListener("resize", scheduleDrawerUpdate);
+  window.addEventListener("scroll", scheduleDrawerUpdate, true);
+  leaderboardTimer = setInterval(async () => {
+    try {
+      const data = await fetchJson("/api/chat/leaderboard");
+      leaderboard.value = data.items || [];
+    } catch {
+      // ignore
+    }
+  }, 30000);
+  activityTimer = setInterval(async () => {
+    try {
+      const data = await fetchJson("/api/chat/activity");
+      chatActivity.value = { per10s: data.per10s || 0, heat: data.heat || "Low" };
+    } catch {
+      // ignore
+    }
+  }, 10000);
 });
 
 onBeforeUnmount(() => {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   if (refreshTimer) clearInterval(refreshTimer);
+  if (leaderboardTimer) clearInterval(leaderboardTimer);
+  if (activityTimer) clearInterval(activityTimer);
+  if (drawerRaf) cancelAnimationFrame(drawerRaf);
+  window.removeEventListener("resize", scheduleDrawerUpdate);
+  window.removeEventListener("scroll", scheduleDrawerUpdate, true);
+  if (countdownTimer) clearInterval(countdownTimer);
   if (ws) ws.close();
   if (pc) pc.close();
   if (statsTimer) clearInterval(statsTimer);
@@ -965,6 +1257,27 @@ watch(playInfo, () => {
     startVideoFps();
   }
 });
+
+watch(selectedMode, () => {
+  localStorage.setItem("playback_mode", selectedMode.value);
+  startPlaybackFromMode();
+});
+
+watch(countdown, () => {
+  if (!countdownTimer) startCountdownTimer();
+});
+
+watch(isMobile, () => {
+  if (!isMobile.value) {
+    showMobileControls.value = false;
+    replayExpanded.value = false;
+    showMobileDrawer.value = false;
+  } else {
+    nextTick(() => {
+      updateDrawerPosition();
+    });
+  }
+});
 </script>
 
 <template>
@@ -1023,7 +1336,9 @@ watch(playInfo, () => {
         <div v-if="!isCollapsed" class="sidebar-body">
           <div class="sidebar-tabs">
             <button class="meow-pill motion-press" :class="overlayTab === 'schedule' ? 'info-tab-active' : ''" type="button" @click="overlayTab = 'schedule'">排期</button>
+            <button v-if="!isMobile" class="meow-pill motion-press" :class="overlayTab === 'playback' ? 'info-tab-active' : ''" type="button" @click="overlayTab = 'playback'">播放</button>
             <button class="meow-pill motion-press" :class="overlayTab === 'tasks' ? 'info-tab-active' : ''" type="button" @click="overlayTab = 'tasks'">任务</button>
+            <button class="meow-pill motion-press" :class="overlayTab === 'rank' ? 'info-tab-active' : ''" type="button" @click="overlayTab = 'rank'">榜单</button>
             <button class="meow-pill motion-press" :class="overlayTab === 'ops' ? 'info-tab-active' : ''" type="button" @click="overlayTab = 'ops'">运营</button>
             <button class="meow-pill motion-press" :class="overlayTab === 'notify' ? 'info-tab-active' : ''" type="button" @click="overlayTab = 'notify'">通知</button>
           </div>
@@ -1038,6 +1353,59 @@ watch(playInfo, () => {
                   <span :title="item.title">{{ item.title }}</span>
                 </div>
                 <div class="meow-window-meta" :title="`主持：${item.host}`">主持：{{ item.host }}</div>
+              </div>
+            </div>
+          </div>
+          <div v-else-if="overlayTab === 'playback'" class="info-panel playback-panel">
+            <div class="playback-title">播放控制</div>
+            <div class="player-controls">
+              <div class="mode-group">
+                <span class="mode-label">延迟模式</span>
+                <div class="mode-buttons">
+                  <button
+                    v-for="mode in modeOptions"
+                    :key="mode"
+                    class="meow-pill motion-press"
+                    :class="selectedMode === mode ? 'info-tab-active' : ''"
+                    type="button"
+                    @click="selectedMode = mode"
+                  >
+                    {{ modeLabels[mode] || mode }}
+                  </button>
+                </div>
+              </div>
+              <div class="replay-group">
+                <span class="mode-label">回放缓冲</span>
+                <div class="mode-buttons">
+                  <button
+                    v-for="step in replayInfo.rewindSteps"
+                    :key="`rewind-${step}`"
+                    class="meow-pill motion-press"
+                    :disabled="!replayInfo.enabled || !(activeMode === 'hls' || activeMode === 'll-hls')"
+                    type="button"
+                    @click="rewindPlayback(step)"
+                  >
+                    回退 {{ step }}s
+                  </button>
+                  <button
+                    class="meow-pill motion-press"
+                    :disabled="!replayInfo.enabled || !(activeMode === 'hls' || activeMode === 'll-hls')"
+                    type="button"
+                    @click="jumpLive"
+                  >
+                    回到直播
+                  </button>
+                </div>
+              </div>
+              <div class="clip-group">
+                <span class="mode-label">剪辑</span>
+                <div class="mode-buttons">
+                  <button class="meow-pill motion-press" type="button" :disabled="clipCreating || stream.status !== 'live'" @click="createClip(15)">15s</button>
+                  <button class="meow-pill motion-press" type="button" :disabled="clipCreating || stream.status !== 'live'" @click="createClip(20)">20s</button>
+                  <button class="meow-pill motion-press" type="button" :disabled="clipCreating || stream.status !== 'live'" @click="createClip(30)">30s</button>
+                  <span v-if="clipNotice" class="clip-note">{{ clipNotice }}</span>
+                  <a v-if="lastClipUrl" class="clip-link" :href="lastClipUrl" target="_blank" rel="noreferrer">打开剪辑</a>
+                </div>
               </div>
             </div>
           </div>
@@ -1080,6 +1448,21 @@ watch(playInfo, () => {
               </a>
             </div>
           </div>
+          <div v-else-if="overlayTab === 'rank'" class="info-panel compact-list">
+            <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">活跃观众榜</div>
+            <div v-if="!leaderboard.length" class="text-xs mt-3" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+              暂无数据
+            </div>
+            <div v-for="item in leaderboard" :key="item.user" class="meow-window-item">
+              <div class="meow-window-time">#{{ item.rank }}</div>
+              <div>
+                <div class="meow-window-titleline">
+                  <span>{{ item.user }}</span>
+                </div>
+                <div class="meow-window-meta">总弹幕 {{ item.messages }} · 本场 {{ item.messages_live }}</div>
+              </div>
+            </div>
+          </div>
           <div v-else class="info-panel">
             <div v-for="alert in opsAlerts" :key="alert.title" class="stat-tile">
               <div class="text-sm font-600">{{ alert.title }}</div>
@@ -1104,6 +1487,9 @@ watch(playInfo, () => {
               <div class="mt-2 text-sm" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
                 主播 {{ stream.host }} · 房间 {{ stream.roomId }} · {{ stream.resolution }}
               </div>
+              <div class="mt-2 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                {{ countdownText }}
+              </div>
             </div>
             <div class="flex items-center gap-2">
               <button
@@ -1117,7 +1503,7 @@ watch(playInfo, () => {
               <span class="text-sm">{{ stream.status === 'live' ? '直播中' : (stream.status === 'ready' ? '准备中' : '离线') }}</span>
             </div>
           </div>
-          <div class="video-frame">
+          <div class="video-frame" ref="videoFrameRef">
           <div class="viewer-screen" :class="isNight ? 'viewer-screen-night' : ''">
             <template v-if="streamUnavailable">
               <div class="viewer-screen-inner">
@@ -1138,7 +1524,56 @@ watch(playInfo, () => {
               <div class="viewer-screen-meta">请在后端配置播放地址</div>
             </div>
           </div>
+          <div v-if="showUnmutePrompt" class="unmute-banner">
+            <div class="unmute-content">
+              <div class="unmute-title">浏览器默认关闭声音</div>
+              <div class="unmute-desc">点击即可开启声音播放</div>
+            </div>
+            <button class="meow-pill motion-press" type="button" @click="requestUnmute">
+              开启声音
+            </button>
           </div>
+          </div>
+          <div v-if="isMobile" class="mobile-drawer-anchor">
+            <div class="mobile-drawer" :style="drawerStyle">
+              <button class="mobile-drawer-toggle" type="button" @click="showMobileDrawer = !showMobileDrawer">
+                {{ showMobileDrawer ? "›" : "‹" }}
+              </button>
+              <div class="mobile-drawer-panel" :class="showMobileDrawer ? 'is-open' : ''">
+                <div class="mobile-controls">
+                  <div class="mobile-replay">
+                    <button class="meow-pill motion-press" type="button" @click="replayExpanded = !replayExpanded">
+                      回放缓冲 {{ replayExpanded ? "收起" : "展开" }}
+                    </button>
+                    <div v-if="replayExpanded" class="mobile-replay-panel">
+                      <button
+                        v-for="step in replayInfo.rewindSteps"
+                        :key="`m-rewind-${step}`"
+                        class="meow-pill motion-press"
+                        :disabled="!replayInfo.enabled || !(activeMode === 'hls' || activeMode === 'll-hls')"
+                        type="button"
+                        @click="rewindPlayback(step)"
+                      >
+                        回退 {{ step }}s
+                      </button>
+                      <button
+                        class="meow-pill motion-press"
+                        :disabled="!replayInfo.enabled || !(activeMode === 'hls' || activeMode === 'll-hls')"
+                        type="button"
+                        @click="jumpLive"
+                      >
+                        回到直播
+                      </button>
+                    </div>
+                  </div>
+                  <button class="meow-pill motion-press" type="button" @click="showMobileControls = true">
+                    功能面板
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="mobile-controls-placeholder"></div>
           <div v-if="playerError && !streamUnavailable" class="player-error mt-2 text-xs text-[#e06b8b]">{{ playerError }}</div>
           <div class="metrics-bar">
             <span>在线观众 {{ stream.viewers }}</span>
@@ -1148,6 +1583,7 @@ watch(playInfo, () => {
             <span class="metric-pill">播放延迟 {{ stream.playoutDelay || "-" }}</span>
             <span class="metric-pill">当前帧率 {{ stream.fps || "-" }}</span>
             <span class="metric-pill">弹幕节奏 {{ chatRateLocal }}</span>
+            <span class="metric-pill">聊天热度 {{ chatActivity.heat }} · {{ chatActivity.per10s }}/10s</span>
             <span class="metrics-copy">© 2026 Meowhuan Live Room</span>
           </div>
         </div>
@@ -1159,11 +1595,12 @@ watch(playInfo, () => {
           <span class="meow-pill">实时</span>
         </div>
         <div class="mt-2 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
-          实时弹幕节奏 {{ chatRateLocal }}
+          实时弹幕节奏 {{ chatRateLocal }} · 热度 {{ chatActivity.heat }}
         </div>
         <div ref="chatScrollRef" class="chat-list mt-3" @scroll="onChatScroll">
           <transition-group ref="chatListRef" name="chat-slide" tag="div">
             <div v-for="item in displayedMessages" :key="item.id || `${item.user}-${item.text}`" class="chat-item">
+              <span v-if="item.level_label" class="chat-level">[{{ item.level_label }}]</span>
               <button class="chat-user" type="button" @click="addMention(item.user)">{{ item.user }}</button>
               <span class="chat-text" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'" v-html="highlightMentions(item.text)"></span>
             </div>
@@ -1172,6 +1609,11 @@ watch(playInfo, () => {
         <button v-if="chatHasNew" class="chat-new-tip" type="button" @click="scrollChatToBottom">
           下方有新消息
         </button>
+        <div class="chat-emoji-bar">
+          <button class="emoji-btn" type="button" @click="appendEmoji(':cat:')">:cat:</button>
+          <button class="emoji-btn" type="button" @click="appendEmoji(':awawa:')">:awawa:</button>
+          <button class="emoji-btn" type="button" @click="appendEmoji(':thonk:')">:thonk:</button>
+        </div>
         <div class="chat-input chat-input-footer" :class="viewerAuthed ? '' : 'is-locked'">
           <input v-model="chatText" class="field-input" placeholder="发送一条弹幕..." :disabled="!viewerAuthed" @keyup.enter="sendChat" />
           <button class="chat-send-btn motion-press" :disabled="chatSending || !viewerAuthed" @click="sendChat">
@@ -1185,6 +1627,7 @@ watch(playInfo, () => {
       </aside>
     </div>
   </div>
+
 
   <div v-if="isMobile && overlayTab === 'notify'" class="mobile-notify-sheet md:hidden">
     <div class="mobile-notify-card" :class="isNight ? 'mobile-notify-night' : 'mobile-notify-day'">
@@ -1212,6 +1655,36 @@ watch(playInfo, () => {
           加入 @Meowhuan_little_nest
         </a>
       </div>
+    </div>
+  </div>
+
+  <div v-if="isMobile && showMobileControls" class="mobile-control-sheet md:hidden">
+    <div class="mobile-control-card" :class="isNight ? 'mobile-notify-night' : 'mobile-notify-day'">
+      <div class="flex items-center justify-between">
+        <div class="font-display text-lg">播放功能面板</div>
+        <button class="meow-pill motion-press" type="button" @click="showMobileControls = false">关闭</button>
+      </div>
+      <div class="mt-4 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">延迟模式</div>
+      <div class="mt-2 flex flex-wrap gap-2">
+        <button
+          v-for="mode in modeOptions"
+          :key="`m-mode-${mode}`"
+          class="meow-pill motion-press"
+          :class="selectedMode === mode ? 'info-tab-active' : ''"
+          type="button"
+          @click="selectedMode = mode"
+        >
+          {{ modeLabels[mode] || mode }}
+        </button>
+      </div>
+      <div class="mt-4 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">剪辑</div>
+      <div class="mt-2 flex flex-wrap gap-2">
+        <button class="meow-pill motion-press" type="button" :disabled="clipCreating || stream.status !== 'live'" @click="createClip(15)">15s</button>
+        <button class="meow-pill motion-press" type="button" :disabled="clipCreating || stream.status !== 'live'" @click="createClip(20)">20s</button>
+        <button class="meow-pill motion-press" type="button" :disabled="clipCreating || stream.status !== 'live'" @click="createClip(30)">30s</button>
+      </div>
+      <div v-if="clipNotice" class="mt-2 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">{{ clipNotice }}</div>
+      <a v-if="lastClipUrl" class="clip-link mt-2 inline-flex" :href="lastClipUrl" target="_blank" rel="noreferrer">打开剪辑</a>
     </div>
   </div>
 
