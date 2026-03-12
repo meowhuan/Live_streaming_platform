@@ -181,6 +181,26 @@ const appendEmoji = (code) => {
   nextTick(() => {});
 };
 
+const resolveLevelLabel = (label) => {
+  if (!label) return "";
+  const raw = String(label).trim();
+  const match = raw.match(/(\d+)/);
+  if (!match) return raw;
+  const level = Number(match[1]);
+  if (!Number.isFinite(level) || level <= 0) return "";
+  return `Lv${level}`;
+};
+
+const resolveLevelClass = (label) => {
+  const raw = String(label || "");
+  const match = raw.match(/(\d+)/);
+  if (!match) return "";
+  const level = Number(match[1]);
+  if (!Number.isFinite(level) || level <= 0) return "";
+  if (level >= 5) return "chat-level-5";
+  return `chat-level-${level}`;
+};
+
 
 const reportWhepStats = async () => {
   if (!pc || pc.connectionState === "closed") return;
@@ -987,17 +1007,28 @@ const startPlaybackFromMode = async () => {
   await startHls(playInfo.value.hls, "hls");
 };
 
+const resolveSeekableEnd = (video) => {
+  if (!video) return null;
+  if (video.seekable && video.seekable.length > 0) {
+    return video.seekable.end(video.seekable.length - 1);
+  }
+  if (Number.isFinite(video.duration)) return video.duration;
+  return null;
+};
+
 const rewindPlayback = (seconds) => {
   const video = videoRef.value;
-  if (!video || !Number.isFinite(video.duration)) return;
-  const target = Math.max(0, video.duration - seconds);
+  const end = resolveSeekableEnd(video);
+  if (end === null) return;
+  const target = Math.max(0, end - seconds);
   video.currentTime = target;
 };
 
 const jumpLive = () => {
   const video = videoRef.value;
-  if (!video || !Number.isFinite(video.duration)) return;
-  video.currentTime = video.duration;
+  const end = resolveSeekableEnd(video);
+  if (end === null) return;
+  video.currentTime = end;
 };
 
 const startWhep = async (url) => {
@@ -1600,8 +1631,14 @@ watch(isMobile, () => {
         <div ref="chatScrollRef" class="chat-list mt-3" @scroll="onChatScroll">
           <transition-group ref="chatListRef" name="chat-slide" tag="div">
             <div v-for="item in displayedMessages" :key="item.id || `${item.user}-${item.text}`" class="chat-item">
-              <span v-if="item.level_label" class="chat-level">[{{ item.level_label }}]</span>
-              <button class="chat-user" type="button" @click="addMention(item.user)">{{ item.user }}</button>
+              <div class="chat-meta">
+                <span
+                  v-if="resolveLevelLabel(item.level_label)"
+                  class="chat-level"
+                  :class="resolveLevelClass(item.level_label)"
+                >{{ resolveLevelLabel(item.level_label) }}</span>
+                <button class="chat-user" type="button" @click="addMention(item.user)">{{ item.user }}</button>
+              </div>
               <span class="chat-text" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'" v-html="highlightMentions(item.text)"></span>
             </div>
           </transition-group>

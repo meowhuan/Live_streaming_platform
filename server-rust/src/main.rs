@@ -1721,8 +1721,10 @@ async fn post_clip_create(
     let task_state = state.clone();
     let clip_id_task = clip_id.clone();
     tokio::spawn(async move {
+        info!("clip build started id={} length_secs={}", clip_id_task, length_secs);
         let result = build_clip_from_hls(&task_state, &clip_id_task, length_secs).await;
         if let Err(err) = result {
+            info!("clip build failed id={} error={}", clip_id_task, err);
             let _ = sqlx::query("UPDATE clips SET status = ?, error = ? WHERE id = ?")
                 .bind("failed")
                 .bind(err)
@@ -1730,6 +1732,7 @@ async fn post_clip_create(
                 .execute(&task_state.pool)
                 .await;
         } else {
+            info!("clip build completed id={}", clip_id_task);
             let _ = sqlx::query("UPDATE clips SET status = ? WHERE id = ?")
                 .bind("ready")
                 .bind(&clip_id_task)
@@ -1803,11 +1806,11 @@ async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: 
         .await
         .map_err(|_| "playlist_read_failed".to_string())?;
 
-    let segments = parse_hls_segments(&playlist, &playlist_url, &read);
-    if segments.is_empty() {
+    let playlist_info = parse_hls_playlist(&playlist, &playlist_url, &read);
+    if playlist_info.segments.is_empty() {
         return Err("no_segments".to_string());
     }
-    let selected = select_hls_segments(&segments, length_secs as f64);
+    let selected = select_hls_segments(&playlist_info.segments, length_secs as f64);
     if selected.is_empty() {
         return Err("segment_select_failed".to_string());
     }
@@ -1818,8 +1821,26 @@ async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: 
         .map_err(|_| "tmp_dir_failed".to_string())?;
 
     let mut list_lines = Vec::new();
+    if let Some(init_url) = playlist_info.init_url.as_ref() {
+        let init_ext = file_extension_from_url(init_url).unwrap_or("mp4");
+        let init_path = tmp_root.join(format!("init.{init_ext}"));
+        let init_bytes = client
+            .get(init_url)
+            .send()
+            .await
+            .map_err(|_| "init_fetch_failed".to_string())?
+            .bytes()
+            .await
+            .map_err(|_| "init_read_failed".to_string())?;
+        fs::write(&init_path, init_bytes)
+            .await
+            .map_err(|_| "init_write_failed".to_string())?;
+        let line = format!("file '{}'", init_path.to_string_lossy().replace('\\', "/"));
+        list_lines.push(line);
+    }
     for (idx, seg) in selected.iter().enumerate() {
-        let path = tmp_root.join(format!("seg_{idx}.ts"));
+        let ext = file_extension_from_url(&seg.url).unwrap_or("ts");
+        let path = tmp_root.join(format!("seg_{idx}.{ext}"));
         let bytes = client
             .get(&seg.url)
             .send()
@@ -1871,13 +1892,33 @@ struct HlsSegment {
     duration: f64,
 }
 
-fn parse_hls_segments(playlist: &str, playlist_url: &str, token: &str) -> Vec<HlsSegment> {
+struct HlsPlaylist {
+    init_url: Option<String>,
+    segments: Vec<HlsSegment>,
+}
+
+fn parse_hls_playlist(playlist: &str, playlist_url: &str, token: &str) -> HlsPlaylist {
     let base = playlist_base(playlist_url);
     let origin = playlist_origin(playlist_url);
     let mut segments = Vec::new();
+    let mut init_url: Option<String> = None;
     let mut current_duration: Option<f64> = None;
     for line in playlist.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with("#EXT-X-MAP:") {
+            if let Some(uri) = parse_hls_attr(trimmed, "URI") {
+                let mut url = if uri.starts_with("http://") || uri.starts_with("https://") {
+                    uri
+                } else if uri.starts_with('/') {
+                    format!("{origin}{uri}")
+                } else {
+                    format!("{base}/{uri}")
+                };
+                url = append_token(&url, token);
+                init_url = Some(url);
+            }
+            continue;
+        }
         if trimmed.starts_with("#EXTINF:") {
             let value = trimmed.trim_start_matches("#EXTINF:");
             let duration = value.split(',').next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
@@ -1901,7 +1942,7 @@ fn parse_hls_segments(playlist: &str, playlist_url: &str, token: &str) -> Vec<Hl
         });
         current_duration = None;
     }
-    segments
+    HlsPlaylist { init_url, segments }
 }
 
 fn select_hls_segments(segments: &[HlsSegment], target_secs: f64) -> Vec<HlsSegment> {
@@ -1944,6 +1985,25 @@ fn append_token(url: &str, token: &str) -> String {
     } else {
         format!("{url}?token={token}")
     }
+}
+
+fn parse_hls_attr(line: &str, key: &str) -> Option<String> {
+    let start = line.find(key)?;
+    let after = &line[start + key.len()..];
+    let after = after.strip_prefix('=')?;
+    let after = after.trim_start();
+    if after.starts_with('"') {
+        let rest = after.trim_start_matches('"');
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_string());
+    }
+    let end = after.find(',').unwrap_or(after.len());
+    Some(after[..end].to_string())
+}
+
+fn file_extension_from_url(url: &str) -> Option<&str> {
+    let clean = url.split('?').next().unwrap_or(url);
+    std::path::Path::new(clean).extension().and_then(|ext| ext.to_str())
 }
 
 async fn run_ffmpeg(bin: &str, args: &[String]) -> Result<(), String> {

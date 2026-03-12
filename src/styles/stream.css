@@ -314,17 +314,69 @@
 }
 
 .chat-level {
-  font-size: 11px;
-  padding: 2px 6px;
+  font-size: 10px;
+  padding: 1px 6px;
   border-radius: 999px;
   background: rgba(255, 196, 224, 0.45);
   color: #5a2d3b;
-  margin-right: 6px;
+  border: 1px solid rgba(233, 217, 234, 0.9);
+  letter-spacing: 0.02em;
 }
 
 .app-night .chat-level {
   background: rgba(120, 98, 166, 0.45);
   color: #f2e9ff;
+  border-color: rgba(120, 136, 200, 0.45);
+}
+
+.chat-level-1 {
+  background: rgba(255, 205, 226, 0.6);
+  color: #5a2d3b;
+}
+
+.chat-level-2 {
+  background: rgba(255, 220, 190, 0.65);
+  color: #6a3b1e;
+}
+
+.chat-level-3 {
+  background: rgba(255, 235, 170, 0.7);
+  color: #6a4a1e;
+}
+
+.chat-level-4 {
+  background: rgba(205, 238, 255, 0.7);
+  color: #234a6a;
+}
+
+.chat-level-5 {
+  background: rgba(206, 220, 255, 0.75);
+  color: #2a326a;
+}
+
+.app-night .chat-level-1 {
+  background: rgba(173, 116, 150, 0.45);
+  color: #f7e9ff;
+}
+
+.app-night .chat-level-2 {
+  background: rgba(182, 126, 90, 0.5);
+  color: #ffe8d6;
+}
+
+.app-night .chat-level-3 {
+  background: rgba(188, 168, 92, 0.52);
+  color: #fff2c8;
+}
+
+.app-night .chat-level-4 {
+  background: rgba(88, 140, 188, 0.55);
+  color: #e8f6ff;
+}
+
+.app-night .chat-level-5 {
+  background: rgba(90, 110, 198, 0.6);
+  color: #e6eaff;
 }
 
 .chat-emoji-bar {
@@ -1024,14 +1076,21 @@
 }
 
 .chat-item {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 10px;
-  align-items: start;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
   padding: 8px 10px;
   border-radius: 14px;
   border: 1px solid rgba(233, 217, 234, 0.8);
   background: rgba(255, 255, 255, 0.7);
+}
+
+.chat-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
 }
 
 .chat-user {
