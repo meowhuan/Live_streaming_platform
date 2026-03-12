@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
@@ -1797,14 +1797,19 @@ async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: 
         read
     );
     let client = Client::new();
-    let playlist = client
-        .get(&playlist_url)
-        .send()
-        .await
-        .map_err(|_| "playlist_fetch_failed".to_string())?
-        .text()
-        .await
-        .map_err(|_| "playlist_read_failed".to_string())?;
+    let playlist = fetch_playlist(&client, &playlist_url).await?;
+    if is_master_playlist(&playlist) {
+        let variant_url = select_hls_variant(&playlist, &playlist_url, &read)
+            .ok_or_else(|| "playlist_variant_missing".to_string())?;
+        let variant_playlist = fetch_playlist(&client, &variant_url).await?;
+        let variant_info = parse_hls_playlist(&variant_playlist, &variant_url, &read);
+        if variant_info.segments.is_empty() {
+            return Err("no_segments".to_string());
+        }
+        let selected = select_hls_segments(&variant_info.segments, length_secs as f64);
+        let segment_count = selected.len().max(1);
+        return build_clip_with_ffmpeg_hls(state, clip_id, &playlist_url, length_secs, segment_count).await;
+    }
 
     let playlist_info = parse_hls_playlist(&playlist, &playlist_url, &read);
     if playlist_info.segments.is_empty() {
@@ -1820,6 +1825,7 @@ async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: 
         .await
         .map_err(|_| "tmp_dir_failed".to_string())?;
 
+    let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut list_lines = Vec::new();
     if let Some(init_url) = playlist_info.init_url.as_ref() {
         let init_ext = file_extension_from_url(init_url).unwrap_or("mp4");
@@ -1835,7 +1841,10 @@ async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: 
         fs::write(&init_path, init_bytes)
             .await
             .map_err(|_| "init_write_failed".to_string())?;
-        let line = format!("file '{}'", init_path.to_string_lossy().replace('\\', "/"));
+        let line = format!(
+            "file '{}'",
+            base_dir.join(&init_path).to_string_lossy().replace('\\', "/")
+        );
         list_lines.push(line);
     }
     for (idx, seg) in selected.iter().enumerate() {
@@ -1852,7 +1861,10 @@ async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: 
         fs::write(&path, bytes)
             .await
             .map_err(|_| "segment_write_failed".to_string())?;
-        let line = format!("file '{}'", path.to_string_lossy().replace('\\', "/"));
+        let line = format!(
+            "file '{}'",
+            base_dir.join(&path).to_string_lossy().replace('\\', "/")
+        );
         list_lines.push(line);
     }
     let concat_path = tmp_root.join("concat.txt");
@@ -1865,7 +1877,7 @@ async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: 
         .await
         .map_err(|_| "clip_dir_failed".to_string())?;
     let output_path = output_dir.join(format!("{clip_id}.mp4"));
-    let concat_path_str = concat_path.to_string_lossy().to_string();
+    let concat_path_str = base_dir.join(&concat_path).to_string_lossy().to_string();
     let output_path_str = output_path.to_string_lossy().to_string();
     let args = vec![
         "-y".to_string(),
@@ -1916,6 +1928,24 @@ fn parse_hls_playlist(playlist: &str, playlist_url: &str, token: &str) -> HlsPla
                 };
                 url = append_token(&url, token);
                 init_url = Some(url);
+            }
+            continue;
+        }
+        if trimmed.starts_with("#EXT-X-PART:") {
+            if let Some(uri) = parse_hls_attr(trimmed, "URI") {
+                let duration = parse_hls_attr(trimmed, "DURATION")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0)
+                    .max(0.05);
+                let mut url = if uri.starts_with("http://") || uri.starts_with("https://") {
+                    uri
+                } else if uri.starts_with('/') {
+                    format!("{origin}{uri}")
+                } else {
+                    format!("{base}/{uri}")
+                };
+                url = append_token(&url, token);
+                segments.push(HlsSegment { url, duration });
             }
             continue;
         }
@@ -1987,6 +2017,47 @@ fn append_token(url: &str, token: &str) -> String {
     }
 }
 
+fn is_master_playlist(playlist: &str) -> bool {
+    playlist.lines().any(|line| line.trim_start().starts_with("#EXT-X-STREAM-INF"))
+}
+
+fn select_hls_variant(playlist: &str, playlist_url: &str, token: &str) -> Option<String> {
+    let base = playlist_base(playlist_url);
+    let origin = playlist_origin(playlist_url);
+    let mut best: Option<(u64, String)> = None;
+    let mut pending_bandwidth: Option<u64> = None;
+    for line in playlist.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#EXT-X-STREAM-INF:") {
+            let bw = parse_hls_attr(trimmed, "BANDWIDTH")
+                .and_then(|v| v.parse::<u64>().ok())
+                .or_else(|| parse_hls_attr(trimmed, "AVERAGE-BANDWIDTH").and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(0);
+            pending_bandwidth = Some(bw);
+            continue;
+        }
+        if pending_bandwidth.is_some() {
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let bw = pending_bandwidth.take().unwrap_or(0);
+            let mut url = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                trimmed.to_string()
+            } else if trimmed.starts_with('/') {
+                format!("{origin}{trimmed}")
+            } else {
+                format!("{base}/{trimmed}")
+            };
+            url = append_token(&url, token);
+            match &best {
+                Some((best_bw, _)) if *best_bw >= bw => {}
+                _ => best = Some((bw, url)),
+            }
+        }
+    }
+    best.map(|(_, url)| url)
+}
+
 fn parse_hls_attr(line: &str, key: &str) -> Option<String> {
     let start = line.find(key)?;
     let after = &line[start + key.len()..];
@@ -2004,6 +2075,53 @@ fn parse_hls_attr(line: &str, key: &str) -> Option<String> {
 fn file_extension_from_url(url: &str) -> Option<&str> {
     let clean = url.split('?').next().unwrap_or(url);
     std::path::Path::new(clean).extension().and_then(|ext| ext.to_str())
+}
+
+async fn fetch_playlist(client: &Client, url: &str) -> Result<String, String> {
+    client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| "playlist_fetch_failed".to_string())?
+        .text()
+        .await
+        .map_err(|_| "playlist_read_failed".to_string())
+}
+
+async fn build_clip_with_ffmpeg_hls(
+    state: &Arc<AppState>,
+    clip_id: &str,
+    playlist_url: &str,
+    length_secs: u64,
+    segment_count: usize,
+) -> Result<(), String> {
+    let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let output_dir = if Path::new(&state.clip_dir).is_absolute() {
+        PathBuf::from(&state.clip_dir)
+    } else {
+        base_dir.join(&state.clip_dir)
+    };
+    fs::create_dir_all(&output_dir)
+        .await
+        .map_err(|_| "clip_dir_failed".to_string())?;
+    let output_path = output_dir.join(format!("{clip_id}.mp4"));
+    let output_path_str = output_path.to_string_lossy().to_string();
+    let start_index = format!("-{}", segment_count.max(1));
+    let args = vec![
+        "-y".to_string(),
+        "-live_start_index".to_string(),
+        start_index,
+        "-i".to_string(),
+        playlist_url.to_string(),
+        "-t".to_string(),
+        length_secs.to_string(),
+        "-c".to_string(),
+        "copy".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        output_path_str,
+    ];
+    run_ffmpeg(&state.ffmpeg_bin, &args).await
 }
 
 async fn run_ffmpeg(bin: &str, args: &[String]) -> Result<(), String> {
@@ -2062,6 +2180,8 @@ async fn run_thumbnail_loop(state: Arc<AppState>) {
             "-i".to_string(),
             source,
             "-frames:v".to_string(),
+            "1".to_string(),
+            "-update".to_string(),
             "1".to_string(),
             "-q:v".to_string(),
             "2".to_string(),
