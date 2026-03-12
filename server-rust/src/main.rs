@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -36,6 +36,7 @@ use tokio::sync::RwLock;
 use tokio::process::Command;
 use tokio::fs;
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 use chrono::TimeZone;
 use tracing::info;
 use tracing_subscriber::fmt::Subscriber;
@@ -497,6 +498,8 @@ async fn main() {
     }
 
     let router = Router::new()
+        .nest_service("/clips", ServeDir::new("public/clips"))
+        .nest_service("/live", ServeDir::new("public/live"))
         .route("/api/stream", get(get_stream))
         .route("/api/stream/status", get(get_stream_status))
         .route("/api/stream/stats", get(get_stats))
@@ -559,6 +562,8 @@ async fn main() {
         .route("/api/ingest/report", post(report_ingest))
         .route(&ws_path, get(ws_handler))
         .layer(CorsLayer::permissive());
+
+    cleanup_duplicate_viewers(&state).await;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Rust backend running at http://localhost:{port}");
@@ -2896,6 +2901,9 @@ async fn viewer_register_verify(
     if !is_valid_email(&email) || username.is_empty() || password.len() < 6 || code.is_empty() {
         return (StatusCode::BAD_REQUEST, HeaderMap::new(), Json(json!({ "error": "invalid" })));
     }
+    if is_reserved_username(&state, username).await {
+        return (StatusCode::CONFLICT, HeaderMap::new(), Json(json!({ "error": "username_reserved" })));
+    }
 
     let mut pending = state.pending_viewer_codes.write().await;
     let Some(stored) = pending.get(&email) else {
@@ -3007,6 +3015,9 @@ async fn viewer_profile_update(
     let next_email = payload.email.trim().to_lowercase();
     if next_username.is_empty() || !is_valid_email(&next_email) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid" })));
+    }
+    if is_reserved_username(&state, next_username).await {
+        return (StatusCode::CONFLICT, Json(json!({ "error": "username_reserved" })));
     }
     let mut accounts = get_viewer_accounts(&state.pool).await;
     let Some(current_idx) = accounts.iter().position(|acc| acc.username.eq_ignore_ascii_case(&username)) else {
@@ -3501,6 +3512,85 @@ async fn get_viewer_accounts(pool: &MySqlPool) -> Vec<ViewerAccount> {
 async fn save_viewer_accounts(pool: &MySqlPool, accounts: &Vec<ViewerAccount>) {
     let payload = serde_json::to_value(accounts).unwrap_or_else(|_| json!([]));
     set_json(pool, "viewer_accounts", &payload).await;
+}
+
+fn normalize_username(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+async fn reserved_usernames(state: &Arc<AppState>) -> HashSet<String> {
+    let mut reserved = HashSet::new();
+    reserved.insert(normalize_username("主播"));
+    let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
+    if let Some(host) = stream.get("host").and_then(|v| v.as_str()) {
+        if !host.trim().is_empty() {
+            reserved.insert(normalize_username(host));
+        }
+    }
+    reserved
+}
+
+async fn is_reserved_username(state: &Arc<AppState>, username: &str) -> bool {
+    let normalized = normalize_username(username);
+    if normalized.is_empty() {
+        return false;
+    }
+    let reserved = reserved_usernames(state).await;
+    reserved.contains(&normalized)
+}
+
+async fn cleanup_duplicate_viewers(state: &Arc<AppState>) {
+    let accounts = get_viewer_accounts(&state.pool).await;
+    if accounts.is_empty() {
+        return;
+    }
+    let reserved = reserved_usernames(state).await;
+    let mut grouped: HashMap<String, Vec<ViewerAccount>> = HashMap::new();
+    for acc in accounts {
+        grouped.entry(normalize_username(&acc.username)).or_default().push(acc);
+    }
+
+    let mut kept = Vec::new();
+    let mut removed: Vec<(ViewerAccount, &'static str)> = Vec::new();
+    for (name, mut group) in grouped {
+        group.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        if reserved.contains(&name) {
+            for acc in group {
+                removed.push((acc, "reserved"));
+            }
+            continue;
+        }
+        let mut iter = group.into_iter();
+        if let Some(first) = iter.next() {
+            kept.push(first);
+        }
+        for acc in iter {
+            removed.push((acc, "duplicate"));
+        }
+    }
+
+    if removed.is_empty() {
+        return;
+    }
+
+    save_viewer_accounts(&state.pool, &kept).await;
+
+    let mut tokens = state.viewer_tokens.write().await;
+    let removed_names: HashSet<String> = removed.iter().map(|(acc, _)| normalize_username(&acc.username)).collect();
+    tokens.retain(|_, session| !removed_names.contains(&normalize_username(&session.username)));
+    drop(tokens);
+
+    let smtp = state.smtp.read().await.clone();
+    if let Some(smtp_cfg) = smtp {
+        for (acc, reason) in removed {
+            let subject = "账号清理通知";
+            let body = match reason {
+                "reserved" => "你的用户名与主播同名，系统已自动清理该账号。请更换用户名后重新注册。",
+                _ => "你的用户名与其他用户重复，系统已自动清理该账号。请更换用户名后重新注册。",
+            };
+            let _ = send_email_code_with_subject(&smtp_cfg, &acc.email, "", subject, body).await;
+        }
+    }
 }
 
 fn hash_password(password: &str) -> String {
