@@ -24,6 +24,9 @@ const stream = ref({
 
 const scheduleList = ref([]);
 const opsAlerts = ref([]);
+const notifications = ref([]);
+const viewerSubscriptions = ref({ live: false, schedule: false, email: false });
+const notifyBanner = ref("");
 
 const chatMessages = ref([]);
 const viewerToken = ref(localStorage.getItem("viewer_token") || "");
@@ -231,16 +234,18 @@ const loadAll = async () => {
   loading.value = true;
   error.value = "";
   try {
-    const [streamRes, scheduleRes, opsRes, chatRes] = await Promise.all([
+    const [streamRes, scheduleRes, opsRes, chatRes, notifyRes] = await Promise.all([
       fetchJson("/api/stream"),
       fetchJson("/api/schedule"),
       fetchJson("/api/ops/alerts"),
-      fetchJson("/api/chat/latest")
+      fetchJson("/api/chat/latest"),
+      fetchJson("/api/notifications")
     ]);
     stream.value = streamRes;
     scheduleList.value = scheduleRes.items || [];
     opsAlerts.value = opsRes.items || [];
     chatMessages.value = (chatRes.items || []).map(normalizeChatMessage);
+    notifications.value = notifyRes.items || [];
     playerError.value = "";
     let playRes = null;
     try {
@@ -296,6 +301,15 @@ const applyUpdate = (type, data) => {
     case "chat:new":
       chatMessages.value = [...chatMessages.value, normalizeChatMessage(data)].slice(-200);
       break;
+    case "notify:new":
+      notifications.value = [...notifications.value, data].slice(-50);
+      if (shouldNotify(data?.type)) {
+        notifyBanner.value = data?.title || "有新通知";
+        setTimeout(() => {
+          notifyBanner.value = "";
+        }, 3000);
+      }
+      break;
     default:
       break;
   }
@@ -323,6 +337,7 @@ const connectWs = () => {
         if (payload.data?.stream) stream.value = payload.data.stream;
         if (payload.data?.schedule) scheduleList.value = payload.data.schedule;
         if (payload.data?.opsAlerts) opsAlerts.value = payload.data.opsAlerts;
+        if (payload.data?.notifications) notifications.value = payload.data.notifications;
         if (payload.data?.chat?.items) chatMessages.value = payload.data.chat.items.map(normalizeChatMessage);
       } else if (payload.type && payload.data) {
         applyUpdate(payload.type, payload.data);
@@ -437,6 +452,7 @@ const loginViewer = async () => {
     localStorage.setItem("viewer_token", viewerToken.value);
     localStorage.setItem("viewer_identity", viewerIdentity.value);
     chatUser.value = viewerIdentity.value;
+    await loadViewerSubscriptions();
     await loadViewerProfile();
     viewerPassword.value = "";
     viewerTurnstileToken.value = "";
@@ -540,6 +556,7 @@ const registerViewer = async () => {
     localStorage.setItem("viewer_token", viewerToken.value);
     localStorage.setItem("viewer_identity", viewerIdentity.value);
     chatUser.value = viewerIdentity.value;
+    await loadViewerSubscriptions();
     await loadViewerProfile();
     viewerPassword.value = "";
     viewerCode.value = "";
@@ -572,6 +589,7 @@ const loadViewerMe = async () => {
     chatUser.value = viewerIdentity.value || chatUser.value;
     if (viewerIdentity.value) showViewerAuth.value = false;
     await loadViewerProfile();
+    await loadViewerSubscriptions();
   } catch {
     // ignore
   }
@@ -751,6 +769,64 @@ onBeforeUnmount(() => {
   }
 });
 
+const shouldNotify = (type) => {
+  if (type === "schedule") return viewerSubscriptions.value.schedule;
+  if (type === "live" || type === "offline") return viewerSubscriptions.value.live;
+  return false;
+};
+
+const loadViewerSubscriptions = async () => {
+  if (!viewerToken.value) return;
+  try {
+    const res = await fetch(apiUrl("/api/viewer/subscribe"), {
+      headers: { authorization: `Bearer ${viewerToken.value}` }
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    viewerSubscriptions.value = {
+      live: !!data.live,
+      schedule: !!data.schedule,
+      email: !!data.email
+    };
+  } catch {
+    // ignore
+  }
+};
+
+const saveViewerSubscriptions = async () => {
+  if (!viewerToken.value) {
+    showViewerAuth.value = true;
+    return;
+  }
+  try {
+    const res = await fetch(apiUrl("/api/viewer/subscribe"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: `Bearer ${viewerToken.value}`
+      },
+      body: JSON.stringify({
+        live: viewerSubscriptions.value.live,
+        schedule: viewerSubscriptions.value.schedule,
+        email: viewerSubscriptions.value.email
+      })
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    viewerSubscriptions.value = {
+      live: !!data.live,
+      schedule: !!data.schedule,
+      email: !!data.email
+    };
+    notifyBanner.value = "订阅已更新";
+    setTimeout(() => {
+      notifyBanner.value = "";
+    }, 2000);
+  } catch {
+    // ignore
+  }
+};
+
 const ensureTurnstileScript = () => {
   if (window.turnstile) return Promise.resolve();
   if (turnstileScriptLoading) return Promise.resolve();
@@ -856,6 +932,9 @@ watch(playInfo, () => {
         </button>
       </div>
     </header>
+    <div v-if="notifyBanner" class="notify-banner">
+      {{ notifyBanner }}
+    </div>
 
     <div class="app-main" :style="{ '--sidebar-width': isCollapsed ? '60px' : '280px' }">
       <aside class="left-sidebar" :class="isCollapsed ? 'is-collapsed' : ''">
@@ -870,6 +949,7 @@ watch(playInfo, () => {
             <button class="meow-pill motion-press" :class="overlayTab === 'schedule' ? 'info-tab-active' : ''" type="button" @click="overlayTab = 'schedule'">排期</button>
             <button class="meow-pill motion-press" :class="overlayTab === 'tasks' ? 'info-tab-active' : ''" type="button" @click="overlayTab = 'tasks'">任务</button>
             <button class="meow-pill motion-press" :class="overlayTab === 'ops' ? 'info-tab-active' : ''" type="button" @click="overlayTab = 'ops'">运营</button>
+            <button class="meow-pill motion-press" :class="overlayTab === 'notify' ? 'info-tab-active' : ''" type="button" @click="overlayTab = 'notify'">通知</button>
           </div>
           <div v-if="overlayTab === 'schedule'" class="info-panel compact-list">
             <div v-for="item in scheduleList" :key="item.title" class="meow-window-item">
@@ -900,6 +980,43 @@ watch(playInfo, () => {
                 加入应援
               </a>
               <button class="meow-btn-ghost motion-press" :class="isNight ? 'border-meow-night-line text-meow-night-ink hover:bg-meow-night-card/80' : ''">打开弹幕</button>
+            </div>
+          </div>
+          <div v-else-if="overlayTab === 'notify'" class="info-panel compact-list">
+            <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">订阅设置</div>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <button class="meow-pill motion-press" :class="viewerSubscriptions.live ? 'info-tab-active' : ''" type="button" @click="viewerSubscriptions.live = !viewerSubscriptions.live; saveViewerSubscriptions()">
+                上下播通知
+              </button>
+              <button class="meow-pill motion-press" :class="viewerSubscriptions.schedule ? 'info-tab-active' : ''" type="button" @click="viewerSubscriptions.schedule = !viewerSubscriptions.schedule; saveViewerSubscriptions()">
+                排期通知
+              </button>
+              <button class="meow-pill motion-press" :class="viewerSubscriptions.email ? 'info-tab-active' : ''" type="button" @click="viewerSubscriptions.email = !viewerSubscriptions.email; saveViewerSubscriptions()">
+                邮件通知
+              </button>
+            </div>
+            <div class="mt-3 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">Telegram 频道</div>
+            <div class="mt-2 flex flex-wrap gap-2 text-xs">
+              <a
+                class="copy-btn"
+                href="https://t.me/Meowhuan_little_nest"
+                target="_blank"
+                rel="noreferrer"
+              >
+                加入 @Meowhuan_little_nest
+              </a>
+            </div>
+            <div class="mt-3 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">最新通知</div>
+            <div class="mt-2 space-y-2">
+              <div v-for="item in notifications.slice(-10).reverse()" :key="item.id" class="meow-window-item">
+                <div class="meow-window-time">{{ item.type }}</div>
+                <div>
+                  <div class="meow-window-titleline">
+                    <span>{{ item.title }}</span>
+                  </div>
+                  <div class="meow-window-meta">{{ item.message }}</div>
+                </div>
+              </div>
             </div>
           </div>
           <div v-else class="info-panel">

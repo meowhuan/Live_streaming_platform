@@ -159,6 +159,7 @@ sudo systemctl status mediamtx
 - `TOKEN_TTL_HOURS`
 - `VIEWER_TOKEN_DAYS`
 - `TURNSTILE_SECRET`
+- `TELEGRAM_BOT_TOKEN`
 - `EMAIL_CODE_TTL_MIN`, `EMAIL_ECHO`
 - `VIEWER_VERIFY_EMAIL_RATE_LIMIT_WINDOW_SEC`
 - `VIEWER_VERIFY_EMAIL_RATE_LIMIT_MAX`
@@ -208,6 +209,8 @@ sudo systemctl status mediamtx
 - `POST /api/admin/smtp`（保存 SMTP）
 - `GET /api/admin/smtp`（读取 SMTP）
 - `POST /api/admin/smtp/test`（测试邮件）
+- `GET /api/admin/telegram/channel`（读取 Telegram 频道）
+- `POST /api/admin/telegram/channel`（保存 Telegram 频道）
 - `GET /api/admin/viewer-anti-abuse`（读取防盗刷配置）
 - `POST /api/admin/viewer-anti-abuse`（保存防盗刷配置）
 
@@ -263,6 +266,12 @@ SRT_FORWARD=srt://127.0.0.1:9001?mode=caller
 后端需要：
 
 - `TURNSTILE_SECRET`
+
+## Telegram 频道通知
+
+- 设置后端环境变量 `TELEGRAM_BOT_TOKEN`。
+- 在管理端「Telegram 通知」里填写频道（支持 `@channel`、`-100...`、或 `https://t.me/xxx`）。
+- 触发直播状态/排期更新时，后端会推送消息到配置的频道。
 
 ## Cloudflare Access（可选）
 
@@ -495,6 +504,8 @@ sudo systemctl status mediamtx
 - `POST /api/admin/smtp` (save SMTP)
 - `GET /api/admin/smtp` (load SMTP)
 - `POST /api/admin/smtp/test`
+- `GET /api/admin/telegram/channel`
+- `POST /api/admin/telegram/channel`
 - `GET /api/admin/viewer-anti-abuse`
 - `POST /api/admin/viewer-anti-abuse`
 
@@ -550,6 +561,12 @@ The frontend uses Cloudflare Turnstile with:
 The backend expects:
 
 - `TURNSTILE_SECRET` in environment
+
+## Telegram Channel Notifications
+
+- Set `TELEGRAM_BOT_TOKEN` in the backend environment.
+- In the admin UI, fill the channel (`@channel`, `-100...`, or `https://t.me/xxx`).
+- Live/schedule events will be sent to the configured channel.
 
 ## Cloudflare Access (Optional)
 

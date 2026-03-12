@@ -1055,6 +1055,25 @@
   color: rgba(190, 196, 224, 0.75);
 }
 
+.notify-banner {
+  margin: 10px auto 0;
+  width: min(1100px, 92vw);
+  padding: 8px 14px;
+  border-radius: 999px;
+  font-size: 12px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(198, 178, 232, 0.6);
+  color: rgba(76, 56, 120, 0.9);
+  backdrop-filter: blur(8px);
+}
+
+.app-night .notify-banner {
+  background: rgba(36, 30, 54, 0.7);
+  border-color: rgba(101, 86, 150, 0.55);
+  color: rgba(214, 198, 255, 0.92);
+}
+
 @media (min-width: 640px) {
   .chat-input {
     grid-template-columns: 1fr auto;

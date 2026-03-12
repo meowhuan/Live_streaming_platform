@@ -62,6 +62,7 @@ struct AppState {
     cf_access_team_domain: Option<String>,
     cf_access_aud: Option<String>,
     cf_access_jwks: RwLock<Option<CfAccessJwksCache>>,
+    telegram_bot_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +137,13 @@ struct ViewerAccount {
     created_at: String,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct ViewerSubscription {
+    live: bool,
+    schedule: bool,
+    email: bool,
+}
+
 struct PendingCode {
     code: String,
     expires_at: Instant,
@@ -167,6 +175,17 @@ struct SmtpPublic {
     reply_to: Option<String>,
     starttls: bool,
     password_set: bool,
+}
+
+#[derive(Deserialize)]
+struct TelegramChannelPayload {
+    channel: String,
+}
+
+#[derive(Serialize)]
+struct TelegramChannelPublic {
+    channel: String,
+    token_configured: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -332,6 +351,7 @@ async fn main() {
         .or_else(|_| std::env::var("CF_ACCESS_AUDIENCE"))
         .ok()
         .filter(|val| !val.trim().is_empty());
+    let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|v| !v.trim().is_empty());
     let viewer_token_ttl = Duration::from_secs(env_u64("VIEWER_TOKEN_DAYS", 30) * 24 * 3600);
     let viewer_anti_abuse_defaults = ViewerAntiAbuseConfig::from_env();
 
@@ -372,6 +392,7 @@ async fn main() {
         cf_access_team_domain,
         cf_access_aud,
         cf_access_jwks: RwLock::new(None),
+        telegram_bot_token,
     };
 
     {
@@ -414,15 +435,20 @@ async fn main() {
         .route("/api/chat/send", post(post_chat_send))
         .route("/api/mediamtx/auth", post(mediamtx_auth))
         .route("/api/mediamtx/metrics", get(get_mediamtx_metrics))
+        .route("/api/notifications", get(get_notifications))
         .route("/api/admin/access-mode", get(admin_access_mode))
         .route("/api/admin/login", post(admin_login))
         .route("/api/admin/turnstile-login", post(admin_turnstile_login))
         .route("/api/admin/smtp", get(admin_smtp_get))
         .route("/api/admin/smtp", post(admin_smtp_set))
         .route("/api/admin/smtp/test", post(admin_smtp_test))
+        .route("/api/admin/telegram/channel", get(admin_telegram_get))
+        .route("/api/admin/telegram/channel", post(admin_telegram_set))
         .route("/api/admin/viewer-anti-abuse", get(admin_viewer_anti_abuse_get))
         .route("/api/admin/viewer-anti-abuse", post(admin_viewer_anti_abuse_set))
         .route("/api/viewer/login", post(viewer_login))
+        .route("/api/viewer/subscribe", get(viewer_subscription_get))
+        .route("/api/viewer/subscribe", post(viewer_subscription_set))
         .route("/api/viewer/register/token", post(viewer_register_token))
         .route("/api/viewer/register/start", post(viewer_register_start))
         .route("/api/viewer/register/verify", post(viewer_register_verify))
@@ -658,6 +684,10 @@ fn default_kv() -> Vec<(String, Value)> {
         { "city": "成都", "latency": "46ms", "load": "高" }
     ]);
 
+    let notifications = json!([]);
+    let subscriptions = json!({});
+    let telegram_channel = json!("");
+
     vec![
         ("stream".to_string(), stream),
         ("stats".to_string(), stats),
@@ -667,6 +697,9 @@ fn default_kv() -> Vec<(String, Value)> {
         ("channels".to_string(), channels),
         ("ops_alerts".to_string(), ops),
         ("nodes".to_string(), nodes),
+        ("notifications".to_string(), notifications),
+        ("viewer_subscriptions".to_string(), subscriptions),
+        ("telegram_channel".to_string(), telegram_channel),
     ]
 }
 
@@ -1009,6 +1042,11 @@ fn is_local_host(host: &str) -> bool {
 async fn get_schedule(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let schedule = get_json(&state.pool, "schedule", default_kv()[4].1.clone()).await;
     Json(json!({ "updatedAt": now_iso(), "items": schedule }))
+}
+
+async fn get_notifications(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let items = get_json(&state.pool, "notifications", json!([])).await;
+    Json(json!({ "updatedAt": now_iso(), "items": items }))
 }
 
 async fn get_channels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1469,6 +1507,36 @@ async fn admin_smtp_test(
     (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
+async fn admin_telegram_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_admin_auth(&headers, &state).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+    }
+    let raw = get_json(&state.pool, "telegram_channel", json!("")).await;
+    let channel = raw.as_str().unwrap_or("").to_string();
+    let token_configured = state
+        .telegram_bot_token
+        .as_ref()
+        .map(|val| !val.trim().is_empty())
+        .unwrap_or(false);
+    (StatusCode::OK, Json(json!(TelegramChannelPublic { channel, token_configured })))
+}
+
+async fn admin_telegram_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<TelegramChannelPayload>,
+) -> impl IntoResponse {
+    if !check_admin_auth(&headers, &state).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+    }
+    let channel = payload.channel.trim().to_string();
+    set_json(&state.pool, "telegram_channel", &json!(channel)).await;
+    (StatusCode::OK, Json(json!({ "ok": true })))
+}
+
 async fn admin_viewer_anti_abuse_get(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1918,6 +1986,7 @@ async fn admin_schedule_replace(
     let items = unwrap_items(&payload);
     set_json(&state.pool, "schedule", &items).await;
     broadcast(&state, "schedule:update", &items);
+    push_notification(&state, "schedule", "排期已更新", "今日排期已同步").await;
     (StatusCode::OK, Json(json!({ "ok": true, "items": items })))
 }
 
@@ -2103,6 +2172,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         "channels": get_json(&state.pool, "channels", default_kv()[5].1.clone()).await,
         "opsAlerts": get_json(&state.pool, "ops_alerts", default_kv()[6].1.clone()).await,
         "nodes": get_json(&state.pool, "nodes", default_kv()[7].1.clone()).await,
+        "notifications": get_json(&state.pool, "notifications", json!([])).await,
         "chat": {
             "items": sqlx::query_as::<_, ChatMessage>(
                 r#"
@@ -2524,9 +2594,26 @@ fn merge_object(target: &mut Value, patch: &Value) {
 
 async fn update_stream_patch(state: &AppState, patch: &Value) {
     let mut current = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
+    let previous_status = current
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("offline")
+        .to_string();
     merge_object(&mut current, patch);
     if let Some(obj) = current.as_object_mut() {
         obj.insert("updatedAt".to_string(), json!(now_iso()));
+    }
+    let next_status = current
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("offline")
+        .to_string();
+    if previous_status != next_status {
+        if next_status == "live" {
+            push_notification(state, "live", "主播已开播", "直播间正在进行中").await;
+        } else if previous_status == "live" {
+            push_notification(state, "offline", "主播已下播", "直播已结束").await;
+        }
     }
     set_json(&state.pool, "stream", &current).await;
     broadcast(state, "stream:update", &current);
@@ -2543,6 +2630,179 @@ fn set_opt(obj: &mut serde_json::Map<String, Value>, key: &str, value: Option<St
     if let Some(value) = value {
         obj.insert(key.to_string(), json!(value));
     }
+}
+
+fn normalize_telegram_chat_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('@') || trimmed.starts_with("-100") {
+        return Some(trimmed.to_string());
+    }
+    if trimmed.chars().all(|c| c == '-' || c.is_ascii_digit()) {
+        return Some(trimmed.to_string());
+    }
+    let normalized = trimmed
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.");
+    let normalized = normalized
+        .strip_prefix("t.me/")
+        .or_else(|| normalized.strip_prefix("telegram.me/"))
+        .unwrap_or(normalized);
+    let segment = normalized.split('?').next().unwrap_or("");
+    let segment = segment.split('/').next().unwrap_or("");
+    if segment.is_empty() || segment.starts_with('+') || segment.contains("joinchat") {
+        return None;
+    }
+    Some(format!("@{segment}"))
+}
+
+async fn send_telegram_message(token: &str, chat_id: &str, text: &str) -> Result<(), String> {
+    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    let client = Client::new();
+    let res = client
+        .post(url)
+        .json(&json!({
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": true
+        }))
+        .send()
+        .await
+        .map_err(|_| "telegram_send_failed")?;
+    if !res.status().is_success() {
+        return Err("telegram_send_failed".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct ViewerSubscriptionPayload {
+    live: Option<bool>,
+    schedule: Option<bool>,
+    email: Option<bool>,
+}
+
+async fn push_notification(state: &AppState, kind: &str, title: &str, message: &str) {
+    let mut items = get_json(&state.pool, "notifications", json!([])).await;
+    let list = items.as_array_mut().unwrap_or_else(|| {
+        items = json!([]);
+        items.as_array_mut().unwrap()
+    });
+    list.push(json!({
+        "id": now_ts(),
+        "type": kind,
+        "title": title,
+        "message": message,
+        "createdAt": now_iso()
+    }));
+    if list.len() > 50 {
+        let overflow = list.len() - 50;
+        list.drain(0..overflow);
+    }
+    set_json(&state.pool, "notifications", &items).await;
+    if let Some(last) = list.last() {
+        broadcast(state, "notify:new", last);
+    }
+
+    let kind = kind.to_string();
+    let title = title.to_string();
+    let message = message.to_string();
+    let pool = state.pool.clone();
+    let smtp = state.smtp.read().await.clone();
+    let telegram_bot_token = state.telegram_bot_token.clone();
+
+    tokio::spawn(async move {
+        let subs_map = get_json(&pool, "viewer_subscriptions", json!({})).await;
+        let mut recipients = Vec::new();
+        if let Some(map) = subs_map.as_object() {
+            for (username, cfg) in map {
+                let live = cfg.get("live").and_then(|v| v.as_bool()).unwrap_or(false);
+                let schedule = cfg.get("schedule").and_then(|v| v.as_bool()).unwrap_or(false);
+                let email = cfg.get("email").and_then(|v| v.as_bool()).unwrap_or(false);
+                let ok = (kind == "live" || kind == "offline") && live || kind == "schedule" && schedule;
+                if ok {
+                    recipients.push((username.clone(), email));
+                }
+            }
+        }
+
+        if recipients.is_empty() {
+            // no-op
+        }
+
+        let accounts = get_viewer_accounts(&pool).await;
+        let mut email_targets = Vec::new();
+        for (username, want_email) in recipients.iter() {
+            if !*want_email {
+                continue;
+            }
+            if let Some(acc) = accounts.iter().find(|acc| acc.username.eq_ignore_ascii_case(username)) {
+                email_targets.push(acc.email.clone());
+            }
+        }
+
+        if let (Some(smtp_cfg), false) = (smtp.clone(), email_targets.is_empty()) {
+            let body = format!("{message}\n\n时间：{time}", time = now_iso());
+            for to in email_targets {
+                let _ = send_email_code_with_subject(&smtp_cfg, &to, "", &title, &body).await;
+            }
+        }
+
+        if let Some(token) = telegram_bot_token.as_ref() {
+            let channel_raw = get_json(&pool, "telegram_channel", json!("")).await;
+            let channel = channel_raw.as_str().unwrap_or("");
+            if let Some(chat_id) = normalize_telegram_chat_id(channel) {
+                let text = format!("{title}\n{message}\n\n时间：{time}", time = now_iso());
+                let _ = send_telegram_message(token, &chat_id, &text).await;
+            }
+        }
+    });
+}
+
+async fn viewer_subscription_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let session = viewer_session_from_header(&headers, &state).await;
+    let Some((_token, username)) = session else {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+    };
+    let mut map = get_json(&state.pool, "viewer_subscriptions", json!({})).await;
+    let entry = map
+        .get(&username)
+        .cloned()
+        .unwrap_or_else(|| json!({ "live": false, "schedule": false, "email": false }));
+    Json(json!({
+        "live": entry.get("live").and_then(|v| v.as_bool()).unwrap_or(false),
+        "schedule": entry.get("schedule").and_then(|v| v.as_bool()).unwrap_or(false),
+        "email": entry.get("email").and_then(|v| v.as_bool()).unwrap_or(false)
+    }))
+}
+
+async fn viewer_subscription_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ViewerSubscriptionPayload>,
+) -> impl IntoResponse {
+    let session = viewer_session_from_header(&headers, &state).await;
+    let Some((_token, username)) = session else {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+    };
+    let mut map = get_json(&state.pool, "viewer_subscriptions", json!({})).await;
+    if !map.is_object() {
+        map = json!({});
+    }
+    let live = payload.live.unwrap_or(false);
+    let schedule = payload.schedule.unwrap_or(false);
+    let email = payload.email.unwrap_or(false);
+    if let Some(obj) = map.as_object_mut() {
+        obj.insert(username.clone(), json!({ "live": live, "schedule": schedule, "email": email }));
+    }
+    set_json(&state.pool, "viewer_subscriptions", &map).await;
+    Json(json!({ "ok": true, "live": live, "schedule": schedule, "email": email }))
 }
 
 async fn verify_turnstile(state: &AppState, token: Option<String>) -> bool {

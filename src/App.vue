@@ -39,6 +39,12 @@ const smtpSaving = ref(false);
 const smtpNotice = ref("");
 const smtpTestTo = ref("");
 const smtpTestSending = ref(false);
+const telegramConfig = ref({
+  channel: "",
+  tokenConfigured: false
+});
+const telegramSaving = ref(false);
+const telegramNotice = ref("");
 const antiAbuseConfig = ref({
   verifyEmailRateLimitWindowSecs: 1800,
   verifyEmailRateLimitMax: 3,
@@ -548,6 +554,62 @@ const loadSmtp = async () => {
   }
 };
 
+const loadTelegram = async () => {
+  if (!adminToken.value) return;
+  try {
+    const res = await fetch(apiUrl("/api/admin/telegram/channel"), {
+      headers: { authorization: `Bearer ${adminToken.value}` }
+    });
+    if (res.status === 401) {
+      clearAdminSession("登录已失效，请重新登录");
+      return;
+    }
+    if (!res.ok) return;
+    const data = await res.json();
+    telegramConfig.value = {
+      channel: data.channel || "",
+      tokenConfigured: !!data.token_configured
+    };
+  } catch {
+    // ignore
+  }
+};
+
+const saveTelegram = async () => {
+  if (!adminToken.value) return;
+  telegramSaving.value = true;
+  telegramNotice.value = "";
+  try {
+    const res = await fetch(apiUrl("/api/admin/telegram/channel"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: `Bearer ${adminToken.value}`
+      },
+      body: JSON.stringify({
+        channel: telegramConfig.value.channel
+      })
+    });
+    if (res.status === 401) {
+      clearAdminSession("登录已失效，请重新登录");
+      return;
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || "保存失败");
+    }
+    telegramNotice.value = "Telegram 频道已保存";
+    loadTelegram();
+  } catch (err) {
+    telegramNotice.value = err instanceof Error ? err.message : "保存失败";
+  } finally {
+    telegramSaving.value = false;
+    setTimeout(() => {
+      telegramNotice.value = "";
+    }, 2000);
+  }
+};
+
 const loginAdminAccess = async () => {
   if (!adminTurnstileToken.value) {
     actionNotice.value = "请完成人机验证";
@@ -764,6 +826,7 @@ let refreshTimer = null;
 const enterAdmin = () => {
   loadAll();
   loadSmtp();
+  loadTelegram();
   loadViewerAntiAbuse();
   connectWs();
   if (!refreshTimer) {
@@ -1596,6 +1659,43 @@ onBeforeUnmount(() => {
                 </button>
               </div>
               <span v-if="smtpNotice" class="text-xs text-[#e06b8b]">{{ smtpNotice }}</span>
+            </div>
+          </div>
+        </section>
+
+        <section id="telegram" class="mt-14">
+          <div
+            class="meow-card motion-card p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex items-center justify-between gap-4">
+              <div>
+                <h3 class="font-display text-xl">Telegram 通知</h3>
+                <p class="mt-2 text-sm" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  配置频道后，直播与排期更新会推送到 Telegram。
+                </p>
+              </div>
+              <button class="meow-btn-ghost motion-press" type="button" @click="loadTelegram">
+                刷新
+              </button>
+            </div>
+            <div class="mt-5 grid gap-4 md:grid-cols-2">
+              <div class="field-group">
+                <label class="field-label">频道</label>
+                <input v-model="telegramConfig.channel" class="field-input" placeholder="@channel 或 https://t.me/xxx" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">Bot 状态</label>
+                <div class="text-sm" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  {{ telegramConfig.tokenConfigured ? "TELEGRAM_BOT_TOKEN 已配置" : "请在后端配置 TELEGRAM_BOT_TOKEN" }}
+                </div>
+              </div>
+            </div>
+            <div class="mt-4 flex flex-wrap items-center gap-3">
+              <button class="meow-btn-primary motion-press" type="button" :disabled="telegramSaving" @click="saveTelegram">
+                保存 Telegram
+              </button>
+              <span v-if="telegramNotice" class="text-xs text-[#e06b8b]">{{ telegramNotice }}</span>
             </div>
           </div>
         </section>
