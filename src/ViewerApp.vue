@@ -609,7 +609,8 @@ const createClip = async (lengthSecs) => {
     if (!res.ok) {
       throw new Error(data?.error || "剪辑创建失败");
     }
-    lastClipUrl.value = data.clip_url || "";
+    const rawUrl = data.clip_url || "";
+    lastClipUrl.value = rawUrl.startsWith("/") ? apiUrl(rawUrl) : rawUrl;
     clipNotice.value = "剪辑已开始生成";
   } catch (err) {
     clipNotice.value = err instanceof Error ? err.message : "剪辑创建失败";
