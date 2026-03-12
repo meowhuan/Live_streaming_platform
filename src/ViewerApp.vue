@@ -29,13 +29,29 @@ const viewerSubscriptions = ref({ live: false, schedule: false, email: false });
 const notifyBanner = ref("");
 
 const chatMessages = ref([]);
-const viewerToken = ref(localStorage.getItem("viewer_token") || "");
+const loadStoredToken = (tokenKey, expiresKey, identityKey) => {
+  const token = localStorage.getItem(tokenKey) || "";
+  const expiresAt = Number(localStorage.getItem(expiresKey) || 0);
+  if (token && expiresAt && Date.now() > expiresAt) {
+    localStorage.removeItem(tokenKey);
+    localStorage.removeItem(expiresKey);
+    if (identityKey) localStorage.removeItem(identityKey);
+    return "";
+  }
+  return token;
+};
+
+const viewerToken = ref(loadStoredToken("viewer_token", "viewer_token_expires_at", "viewer_identity"));
 const viewerIdentity = ref(localStorage.getItem("viewer_identity") || "");
-const viewerAuthed = computed(() => !!viewerToken.value);
+const viewerSessionOk = ref(false);
+const viewerAuthed = computed(() => !!viewerToken.value || viewerSessionOk.value);
 const viewerMode = ref("login");
 const viewerEmail = ref("");
-const viewerUsername = ref("");
-const viewerPassword = ref("");
+const viewerUsername = ref(localStorage.getItem("viewer_user") || "");
+const viewerPassword = ref(localStorage.getItem("viewer_pass") || "");
+const viewerRememberUser = ref(!!localStorage.getItem("viewer_user"));
+const viewerRememberPass = ref(!!localStorage.getItem("viewer_pass"));
+const viewerRememberDays = ref(Number(localStorage.getItem("viewer_remember_days") || 0) || 0);
 const viewerCode = ref("");
 const viewerNotice = ref("");
 const viewerSending = ref(false);
@@ -84,6 +100,7 @@ const overlayTab = ref("schedule");
 const isCollapsed = ref(false);
 const chatAtBottom = ref(true);
 const chatHasNew = ref(false);
+const isMobile = ref(false);
 
 const normalizePlayUrl = (raw) => {
   if (!raw) return raw;
@@ -414,6 +431,11 @@ const sendChat = async () => {
       body: JSON.stringify({ text })
     });
     if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      notifyBanner.value = data?.error || "发送失败";
+      setTimeout(() => {
+        notifyBanner.value = "";
+      }, 2000);
       return;
     }
     chatText.value = "";
@@ -440,7 +462,8 @@ const loginViewer = async () => {
       body: JSON.stringify({
         username: viewerUsername.value,
         password: viewerPassword.value,
-        turnstileToken: viewerTurnstileToken.value
+        turnstileToken: viewerTurnstileToken.value,
+        rememberDays: viewerRememberDays.value || undefined
       })
     });
     const data = await res.json().catch(() => ({}));
@@ -448,9 +471,28 @@ const loginViewer = async () => {
       throw new Error(data?.error || "登录失败");
     }
     viewerToken.value = data.token;
+    viewerSessionOk.value = true;
     viewerIdentity.value = data.username || viewerUsername.value.trim();
     localStorage.setItem("viewer_token", viewerToken.value);
     localStorage.setItem("viewer_identity", viewerIdentity.value);
+    if (data.expiresIn) {
+      localStorage.setItem("viewer_token_expires_at", String(Date.now() + Number(data.expiresIn) * 1000));
+    }
+    if (viewerRememberUser.value) {
+      localStorage.setItem("viewer_user", viewerUsername.value.trim());
+    } else {
+      localStorage.removeItem("viewer_user");
+    }
+    if (viewerRememberPass.value) {
+      localStorage.setItem("viewer_pass", viewerPassword.value);
+    } else {
+      localStorage.removeItem("viewer_pass");
+    }
+    if (viewerRememberDays.value) {
+      localStorage.setItem("viewer_remember_days", String(viewerRememberDays.value));
+    } else {
+      localStorage.removeItem("viewer_remember_days");
+    }
     chatUser.value = viewerIdentity.value;
     await loadViewerSubscriptions();
     await loadViewerProfile();
@@ -552,9 +594,13 @@ const registerViewer = async () => {
       throw new Error(data?.error || "注册失败");
     }
     viewerToken.value = data.token;
+    viewerSessionOk.value = true;
     viewerIdentity.value = data.username || username;
     localStorage.setItem("viewer_token", viewerToken.value);
     localStorage.setItem("viewer_identity", viewerIdentity.value);
+    if (data.expiresIn) {
+      localStorage.setItem("viewer_token_expires_at", String(Date.now() + Number(data.expiresIn) * 1000));
+    }
     chatUser.value = viewerIdentity.value;
     await loadViewerSubscriptions();
     await loadViewerProfile();
@@ -572,28 +618,47 @@ const registerViewer = async () => {
 };
 
 const loadViewerMe = async () => {
-  if (!viewerToken.value) return;
   try {
     const res = await fetch(apiUrl("/api/viewer/me"), {
-      headers: { authorization: `Bearer ${viewerToken.value}` }
+      headers: {
+        ...(viewerToken.value ? { authorization: `Bearer ${viewerToken.value}` } : {})
+      }
     });
     if (!res.ok) {
       viewerToken.value = "";
       viewerIdentity.value = "";
       localStorage.removeItem("viewer_token");
+      localStorage.removeItem("viewer_token_expires_at");
       localStorage.removeItem("viewer_identity");
+      viewerSessionOk.value = false;
       return;
     }
     const data = await res.json();
     viewerIdentity.value = data.username || viewerIdentity.value;
     chatUser.value = viewerIdentity.value || chatUser.value;
     if (viewerIdentity.value) showViewerAuth.value = false;
+    viewerSessionOk.value = true;
     await loadViewerProfile();
     await loadViewerSubscriptions();
   } catch {
     // ignore
   }
 };
+
+const setupMobileWatch = () => {
+  if (typeof window === "undefined" || !window.matchMedia) return;
+  const mq = window.matchMedia("(max-width: 768px)");
+  const update = () => {
+    isMobile.value = mq.matches;
+  };
+  update();
+  if (typeof mq.addEventListener === "function") {
+    mq.addEventListener("change", update);
+  } else {
+    mq.addListener(update);
+  }
+};
+
 
 const loadViewerProfile = async () => {
   if (!viewerToken.value) return;
@@ -647,10 +712,13 @@ const saveViewerProfile = async () => {
 };
 
 const logoutViewer = () => {
+  fetch(apiUrl("/api/viewer/logout"), { method: "POST" }).catch(() => {});
   viewerToken.value = "";
   viewerIdentity.value = "";
   localStorage.removeItem("viewer_token");
+  localStorage.removeItem("viewer_token_expires_at");
   localStorage.removeItem("viewer_identity");
+  viewerSessionOk.value = false;
   showViewerProfile.value = false;
 };
 
@@ -735,6 +803,7 @@ onMounted(() => {
   connectWs();
   loadViewerMe();
   ensureTurnstileScript();
+  setupMobileWatch();
   window.onViewerTurnstile = (token) => {
     viewerTurnstileToken.value = token;
   };
@@ -771,7 +840,6 @@ onBeforeUnmount(() => {
 
 const shouldNotify = (type) => {
   if (type === "schedule") return viewerSubscriptions.value.schedule;
-  if (type === "live" || type === "offline") return viewerSubscriptions.value.live;
   return false;
 };
 
@@ -881,6 +949,7 @@ watch([showViewerAuth, viewerMode], () => {
   if (showViewerAuth.value) renderViewerTurnstile();
 });
 
+
 watch(chatMessages, () => {
   nextTick(() => {
     if (chatAtBottom.value) {
@@ -917,6 +986,13 @@ watch(playInfo, () => {
         </div>
       </div>
       <div class="flex items-center gap-2 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+        <button
+          class="meow-pill motion-press hidden md:inline-flex"
+          type="button"
+          @click="overlayTab = 'notify'"
+        >
+          关注
+        </button>
         <span class="status-pill" :class="wsStatus === 'connected' ? 'status-live' : 'status-idle'">
           <span class="status-dot"></span>
           {{ wsStatus === "connected" ? "实时连接" : "同步中" }}
@@ -983,11 +1059,8 @@ watch(playInfo, () => {
             </div>
           </div>
           <div v-else-if="overlayTab === 'notify'" class="info-panel compact-list">
-            <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">订阅设置</div>
+            <div class="text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">关注设置</div>
             <div class="mt-2 flex flex-wrap gap-2">
-              <button class="meow-pill motion-press" :class="viewerSubscriptions.live ? 'info-tab-active' : ''" type="button" @click="viewerSubscriptions.live = !viewerSubscriptions.live; saveViewerSubscriptions()">
-                上下播通知
-              </button>
               <button class="meow-pill motion-press" :class="viewerSubscriptions.schedule ? 'info-tab-active' : ''" type="button" @click="viewerSubscriptions.schedule = !viewerSubscriptions.schedule; saveViewerSubscriptions()">
                 排期通知
               </button>
@@ -1005,18 +1078,6 @@ watch(playInfo, () => {
               >
                 加入 @Meowhuan_little_nest
               </a>
-            </div>
-            <div class="mt-3 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">最新通知</div>
-            <div class="mt-2 space-y-2">
-              <div v-for="item in notifications.slice(-10).reverse()" :key="item.id" class="meow-window-item">
-                <div class="meow-window-time">{{ item.type }}</div>
-                <div>
-                  <div class="meow-window-titleline">
-                    <span>{{ item.title }}</span>
-                  </div>
-                  <div class="meow-window-meta">{{ item.message }}</div>
-                </div>
-              </div>
             </div>
           </div>
           <div v-else class="info-panel">
@@ -1045,6 +1106,13 @@ watch(playInfo, () => {
               </div>
             </div>
             <div class="flex items-center gap-2">
+              <button
+                class="meow-pill motion-press md:hidden"
+                type="button"
+                @click="overlayTab = 'notify'; isCollapsed = false"
+              >
+                关注
+              </button>
               <span class="status-lamp" :class="stream.status === 'live' ? 'status-live' : (stream.status === 'ready' ? 'status-warn' : 'status-idle')"></span>
               <span class="text-sm">{{ stream.status === 'live' ? '直播中' : (stream.status === 'ready' ? '准备中' : '离线') }}</span>
             </div>
@@ -1118,6 +1186,36 @@ watch(playInfo, () => {
     </div>
   </div>
 
+  <div v-if="isMobile && overlayTab === 'notify'" class="mobile-notify-sheet md:hidden">
+    <div class="mobile-notify-card" :class="isNight ? 'mobile-notify-night' : 'mobile-notify-day'">
+      <div class="flex items-center justify-between">
+        <div class="font-display text-lg">关注与通知</div>
+        <button class="meow-pill motion-press" type="button" @click="overlayTab = 'schedule'">关闭</button>
+      </div>
+      <div class="mt-4 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">关注设置</div>
+      <div class="mt-2 flex flex-wrap gap-2">
+        <button class="meow-pill motion-press" :class="viewerSubscriptions.schedule ? 'info-tab-active' : ''" type="button" @click="viewerSubscriptions.schedule = !viewerSubscriptions.schedule; saveViewerSubscriptions()">
+          排期通知
+        </button>
+        <button class="meow-pill motion-press" :class="viewerSubscriptions.email ? 'info-tab-active' : ''" type="button" @click="viewerSubscriptions.email = !viewerSubscriptions.email; saveViewerSubscriptions()">
+          邮件通知
+        </button>
+      </div>
+      <div class="mt-3 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">Telegram 频道</div>
+      <div class="mt-2 flex flex-wrap gap-2 text-xs">
+        <a
+          class="copy-btn"
+          href="https://t.me/Meowhuan_little_nest"
+          target="_blank"
+          rel="noreferrer"
+        >
+          加入 @Meowhuan_little_nest
+        </a>
+      </div>
+    </div>
+  </div>
+
+
   <div v-if="showViewerAuth" class="auth-overlay">
     <div class="auth-card" :class="isNight ? 'auth-card-night' : 'auth-card-day'">
       <div class="flex items-center justify-between">
@@ -1141,6 +1239,24 @@ watch(playInfo, () => {
         <div class="field-group">
           <label class="field-label">密码</label>
           <input v-model="viewerPassword" class="field-input" type="password" placeholder="••••••••" />
+        </div>
+        <div class="field-group">
+          <label class="field-label">登录保持</label>
+          <div class="flex flex-wrap items-center gap-3 text-xs">
+            <label class="meow-pill motion-press">
+              <input type="checkbox" class="mr-2" v-model="viewerRememberUser" />
+              记住账号
+            </label>
+            <label class="meow-pill motion-press">
+              <input type="checkbox" class="mr-2" v-model="viewerRememberPass" />
+              记住密码（仅本机）
+            </label>
+            <select v-model="viewerRememberDays" class="field-input !h-8 !text-xs w-[140px]">
+              <option :value="0">默认时长</option>
+              <option :value="7">保持 7 天</option>
+              <option :value="30">保持 30 天</option>
+            </select>
+          </div>
         </div>
           <div class="field-group">
             <label class="field-label">人机验证</label>

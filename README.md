@@ -159,7 +159,9 @@ sudo systemctl status mediamtx
 - `TOKEN_TTL_HOURS`
 - `VIEWER_TOKEN_DAYS`
 - `TURNSTILE_SECRET`
+- `PUBLIC_BASE_URL`（用于通知里拼接直播地址）
 - `TELEGRAM_BOT_TOKEN`
+- `CHAT_FILTER_WORDS`
 - `EMAIL_CODE_TTL_MIN`, `EMAIL_ECHO`
 - `VIEWER_VERIFY_EMAIL_RATE_LIMIT_WINDOW_SEC`
 - `VIEWER_VERIFY_EMAIL_RATE_LIMIT_MAX`
@@ -272,6 +274,17 @@ SRT_FORWARD=srt://127.0.0.1:9001?mode=caller
 - 设置后端环境变量 `TELEGRAM_BOT_TOKEN`。
 - 在管理端「Telegram 通知」里填写频道（支持 `@channel`、`-100...`、或 `https://t.me/xxx`）。
 - 触发直播状态/排期更新时，后端会推送消息到配置的频道。
+
+## 通知模板
+
+- 管理端可配置通知标题、内容与直播地址。
+- 支持占位符：`{title}`, `{host}`, `{roomId}`, `{status}`, `{time}`, `{liveUrl}`, `{scheduleTime}`, `{scheduleTitle}`, `{scheduleHost}`
+- 支持规则匹配（正则）按需替换，规则里可用 `$1` 等捕获组。
+
+## 弹幕过滤
+
+- `CHAT_FILTER_WORDS`：用英文逗号分隔敏感词（大小写不敏感）。
+- 示例（中英混合）：`傻逼,操你妈,色情,约炮,赌博,博彩,诈骗,引流,刷单,贷款,sex,porn,casino,scam`
 
 ## Cloudflare Access（可选）
 

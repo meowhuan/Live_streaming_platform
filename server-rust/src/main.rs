@@ -14,6 +14,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use axum::http::header::SET_COOKIE;
 use dotenvy::dotenv;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -63,7 +64,12 @@ struct AppState {
     cf_access_aud: Option<String>,
     cf_access_jwks: RwLock<Option<CfAccessJwksCache>>,
     telegram_bot_token: Option<String>,
+    chat_filter_words: Vec<String>,
+    public_base_url: String,
 }
+
+const ADMIN_COOKIE: &str = "meow_admin_token";
+const VIEWER_COOKIE: &str = "meow_viewer_token";
 
 #[derive(Deserialize)]
 struct StreamUpdate {
@@ -90,6 +96,8 @@ struct LoginPayload {
     password: String,
     #[serde(rename = "turnstileToken")]
     turnstile_token: Option<String>,
+    #[serde(rename = "rememberDays")]
+    remember_days: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -109,6 +117,8 @@ struct RegisterTokenPayload {
 struct AdminTurnstilePayload {
     #[serde(rename = "turnstileToken")]
     turnstile_token: Option<String>,
+    #[serde(rename = "rememberDays")]
+    remember_days: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -336,6 +346,7 @@ async fn main() {
     let email_echo = std::env::var("EMAIL_ECHO")
         .map(|val| val.to_lowercase() != "false")
         .unwrap_or(true);
+    let public_base_url = std::env::var("PUBLIC_BASE_URL").unwrap_or_default();
     let turnstile_secret = std::env::var("TURNSTILE_SECRET").ok().filter(|val| !val.trim().is_empty());
     let cf_access_team_domain = std::env::var("CF_ACCESS_TEAM_DOMAIN")
         .ok()
@@ -345,6 +356,13 @@ async fn main() {
         .ok()
         .filter(|val| !val.trim().is_empty());
     let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|v| !v.trim().is_empty());
+    let chat_filter_words = std::env::var("CHAT_FILTER_WORDS")
+        .ok()
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
     let viewer_token_ttl = Duration::from_secs(env_u64("VIEWER_TOKEN_DAYS", 30) * 24 * 3600);
     let viewer_anti_abuse_defaults = ViewerAntiAbuseConfig::from_env();
 
@@ -386,6 +404,8 @@ async fn main() {
         cf_access_aud,
         cf_access_jwks: RwLock::new(None),
         telegram_bot_token,
+        chat_filter_words,
+        public_base_url,
     };
 
     {
@@ -431,15 +451,20 @@ async fn main() {
         .route("/api/notifications", get(get_notifications))
         .route("/api/admin/access-mode", get(admin_access_mode))
         .route("/api/admin/login", post(admin_login))
+        .route("/api/admin/logout", post(admin_logout))
+        .route("/api/admin/me", get(admin_me))
         .route("/api/admin/turnstile-login", post(admin_turnstile_login))
         .route("/api/admin/smtp", get(admin_smtp_get))
         .route("/api/admin/smtp", post(admin_smtp_set))
         .route("/api/admin/smtp/test", post(admin_smtp_test))
         .route("/api/admin/telegram/channel", get(admin_telegram_get))
         .route("/api/admin/telegram/channel", post(admin_telegram_set))
+        .route("/api/admin/notify-templates", get(admin_notify_templates_get))
+        .route("/api/admin/notify-templates", post(admin_notify_templates_set))
         .route("/api/admin/viewer-anti-abuse", get(admin_viewer_anti_abuse_get))
         .route("/api/admin/viewer-anti-abuse", post(admin_viewer_anti_abuse_set))
         .route("/api/viewer/login", post(viewer_login))
+        .route("/api/viewer/logout", post(viewer_logout))
         .route("/api/viewer/subscribe", get(viewer_subscription_get))
         .route("/api/viewer/subscribe", post(viewer_subscription_set))
         .route("/api/viewer/register/token", post(viewer_register_token))
@@ -680,6 +705,7 @@ fn default_kv() -> Vec<(String, Value)> {
     let notifications = json!([]);
     let subscriptions = json!({});
     let telegram_channel = json!("");
+    let notify_templates = default_notify_templates();
 
     vec![
         ("stream".to_string(), stream),
@@ -693,11 +719,34 @@ fn default_kv() -> Vec<(String, Value)> {
         ("notifications".to_string(), notifications),
         ("viewer_subscriptions".to_string(), subscriptions),
         ("telegram_channel".to_string(), telegram_channel),
+        ("notify_templates".to_string(), notify_templates),
     ]
 }
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn default_notify_templates() -> Value {
+    json!({
+        "live": {
+            "title": "主播已开播",
+            "message": "直播间已开始：{title}\n主播：{host}\n观看地址：{liveUrl}",
+            "url": ""
+        },
+        "offline": {
+            "title": "主播已下播",
+            "message": "直播已结束：{title}\n感谢陪伴",
+            "url": ""
+        },
+        "schedule": {
+            "title": "排期已更新",
+            "message": "今日排期已同步，下一场：{scheduleTime} {scheduleTitle}",
+            "url": ""
+        },
+        "live_url": "",
+        "rules": []
+    })
 }
 
 fn env_u16(key: &str, fallback: u16) -> u16 {
@@ -726,6 +775,21 @@ fn env_bool(key: &str, fallback: bool) -> bool {
         .ok()
         .map(|val| matches!(val.as_str(), "1" | "true" | "TRUE" | "True"))
         .unwrap_or(fallback)
+}
+
+fn normalize_remember_days(days: Option<u64>) -> Option<u64> {
+    match days {
+        Some(7) => Some(7),
+        Some(30) => Some(30),
+        _ => None,
+    }
+}
+
+fn ttl_from_remember(default: Duration, remember_days: Option<u64>) -> Duration {
+    if let Some(days) = normalize_remember_days(remember_days) {
+        return Duration::from_secs(days * 24 * 3600);
+    }
+    default
 }
 
 impl ViewerAntiAbuseConfig {
@@ -1090,6 +1154,12 @@ async fn post_chat_send(
 
     let user = user.chars().take(24).collect::<String>();
     let text = text.chars().take(120).collect::<String>();
+    if !state.chat_filter_words.is_empty() {
+        let lowered = text.to_lowercase();
+        if state.chat_filter_words.iter().any(|word| lowered.contains(word)) {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "含有敏感词" })));
+        }
+    }
 
     let result = sqlx::query(
         "INSERT INTO chat_messages (user, text) VALUES (?, ?)"
@@ -1351,10 +1421,10 @@ async fn admin_login(
     Json(payload): Json<LoginPayload>,
 ) -> impl IntoResponse {
     if cf_access_enabled(&state) && !verify_cf_access(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "access" })));
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "access" })));
     }
     if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "turnstile" })));
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "turnstile" })));
     }
     let authed = if payload.username == state.admin_user && payload.password == state.admin_pass {
         true
@@ -1369,20 +1439,28 @@ async fn admin_login(
         })
     };
     if !authed {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "invalid" })));
     }
 
+    let ttl = ttl_from_remember(state.token_ttl, payload.remember_days);
     let token = generate_key();
     let mut tokens = state.tokens.write().await;
-    tokens.insert(token.clone(), Instant::now() + state.token_ttl);
+    tokens.insert(token.clone(), Instant::now() + ttl);
 
-    let viewer_token = issue_viewer_token(&state, payload.username.trim().to_string(), true).await;
-    (StatusCode::OK, Json(json!({
-        "token": token,
-        "expiresIn": state.token_ttl.as_secs(),
-        "viewerToken": viewer_token,
-        "viewerName": payload.username.trim()
-    })))
+    let viewer_token = issue_viewer_token(&state, payload.username.trim().to_string(), true, Some(ttl)).await;
+    let mut headers_out = HeaderMap::new();
+    append_cookie(&mut headers_out, build_cookie(ADMIN_COOKIE, &token, ttl.as_secs()));
+    append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &viewer_token, ttl.as_secs()));
+    (
+        StatusCode::OK,
+        headers_out,
+        Json(json!({
+            "token": token,
+            "expiresIn": ttl.as_secs(),
+            "viewerToken": viewer_token,
+            "viewerName": payload.username.trim()
+        }))
+    )
 }
 
 async fn admin_access_mode(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1394,32 +1472,57 @@ async fn admin_access_mode(State(state): State<Arc<AppState>>) -> impl IntoRespo
     )
 }
 
+async fn admin_me(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_admin_auth(&headers, &state).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+    }
+    (StatusCode::OK, Json(json!({ "ok": true })))
+}
+
+async fn admin_logout() -> impl IntoResponse {
+    let mut headers_out = HeaderMap::new();
+    append_cookie(&mut headers_out, clear_cookie(ADMIN_COOKIE));
+    append_cookie(&mut headers_out, clear_cookie(VIEWER_COOKIE));
+    (StatusCode::OK, headers_out, Json(json!({ "ok": true })))
+}
+
 async fn admin_turnstile_login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(payload): Json<AdminTurnstilePayload>,
 ) -> impl IntoResponse {
     if !cf_access_enabled(&state) {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "access_not_enabled" })));
+        return (StatusCode::BAD_REQUEST, HeaderMap::new(), Json(json!({ "error": "access_not_enabled" })));
     }
     if !verify_cf_access(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "access" })));
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "access" })));
     }
     if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "turnstile" })));
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "turnstile" })));
     }
 
+    let ttl = ttl_from_remember(state.token_ttl, payload.remember_days);
     let token = generate_key();
     let mut tokens = state.tokens.write().await;
-    tokens.insert(token.clone(), Instant::now() + state.token_ttl);
+    tokens.insert(token.clone(), Instant::now() + ttl);
 
-    let viewer_token = issue_viewer_token(&state, "主播".to_string(), true).await;
-    (StatusCode::OK, Json(json!({
-        "token": token,
-        "expiresIn": state.token_ttl.as_secs(),
-        "viewerToken": viewer_token,
-        "viewerName": "主播"
-    })))
+    let viewer_token = issue_viewer_token(&state, "主播".to_string(), true, Some(ttl)).await;
+    let mut headers_out = HeaderMap::new();
+    append_cookie(&mut headers_out, build_cookie(ADMIN_COOKIE, &token, ttl.as_secs()));
+    append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &viewer_token, ttl.as_secs()));
+    (
+        StatusCode::OK,
+        headers_out,
+        Json(json!({
+            "token": token,
+            "expiresIn": ttl.as_secs(),
+            "viewerToken": viewer_token,
+            "viewerName": "主播"
+        }))
+    )
 }
 
 async fn admin_smtp_get(
@@ -1527,6 +1630,32 @@ async fn admin_telegram_set(
     }
     let channel = payload.channel.trim().to_string();
     set_json(&state.pool, "telegram_channel", &json!(channel)).await;
+    (StatusCode::OK, Json(json!({ "ok": true })))
+}
+
+async fn admin_notify_templates_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_admin_auth(&headers, &state).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+    }
+    let data = get_json(&state.pool, "notify_templates", default_notify_templates()).await;
+    (StatusCode::OK, Json(json!({ "data": data })))
+}
+
+async fn admin_notify_templates_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    if !check_admin_auth(&headers, &state).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+    }
+    if !payload.is_object() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid" })));
+    }
+    set_json(&state.pool, "notify_templates", &payload).await;
     (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
@@ -1796,7 +1925,7 @@ async fn viewer_register_verify(
     Json(payload): Json<RegisterVerifyPayload>,
 ) -> impl IntoResponse {
     if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "turnstile" })));
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "turnstile" })));
     }
     let email = payload.email.trim().to_lowercase();
     let username = payload.username.trim();
@@ -1804,23 +1933,23 @@ async fn viewer_register_verify(
     let code = payload.code.trim();
 
     if !is_valid_email(&email) || username.is_empty() || password.len() < 6 || code.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid" })));
+        return (StatusCode::BAD_REQUEST, HeaderMap::new(), Json(json!({ "error": "invalid" })));
     }
 
     let mut pending = state.pending_viewer_codes.write().await;
     let Some(stored) = pending.get(&email) else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "code" })));
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "code" })));
     };
     if stored.expires_at < Instant::now() || stored.code != code {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "code" })));
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "code" })));
     }
 
     let mut accounts = get_viewer_accounts(&state.pool).await;
     if accounts.iter().any(|acc| acc.email.eq_ignore_ascii_case(&email)) {
-        return (StatusCode::CONFLICT, Json(json!({ "error": "email_exists" })));
+        return (StatusCode::CONFLICT, HeaderMap::new(), Json(json!({ "error": "email_exists" })));
     }
     if accounts.iter().any(|acc| acc.username.eq_ignore_ascii_case(username)) {
-        return (StatusCode::CONFLICT, Json(json!({ "error": "username_exists" })));
+        return (StatusCode::CONFLICT, HeaderMap::new(), Json(json!({ "error": "username_exists" })));
     }
 
     accounts.push(ViewerAccount {
@@ -1832,8 +1961,14 @@ async fn viewer_register_verify(
     save_viewer_accounts(&state.pool, &accounts).await;
     pending.remove(&email);
 
-    let token = issue_viewer_token(&state, username.to_string(), false).await;
-    (StatusCode::OK, Json(json!({ "ok": true, "token": token, "username": username, "expiresIn": state.viewer_token_ttl.as_secs() })))
+    let token = issue_viewer_token(&state, username.to_string(), false, None).await;
+    let mut headers_out = HeaderMap::new();
+    append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &token, state.viewer_token_ttl.as_secs()));
+    (
+        StatusCode::OK,
+        headers_out,
+        Json(json!({ "ok": true, "token": token, "username": username, "expiresIn": state.viewer_token_ttl.as_secs() }))
+    )
 }
 
 async fn viewer_login(
@@ -1841,7 +1976,7 @@ async fn viewer_login(
     Json(payload): Json<LoginPayload>,
 ) -> impl IntoResponse {
     if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "turnstile" })));
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "turnstile" })));
     }
     let accounts = get_viewer_accounts(&state.pool).await;
     let username = payload.username.trim();
@@ -1852,11 +1987,18 @@ async fn viewer_login(
             && account.password_hash == password_hash
     });
     if !authed {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "invalid" })));
     }
 
-    let token = issue_viewer_token(&state, username.to_string(), false).await;
-    (StatusCode::OK, Json(json!({ "token": token, "username": username, "expiresIn": state.viewer_token_ttl.as_secs() })))
+    let ttl = ttl_from_remember(state.viewer_token_ttl, payload.remember_days);
+    let token = issue_viewer_token(&state, username.to_string(), false, Some(ttl)).await;
+    let mut headers_out = HeaderMap::new();
+    append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &token, ttl.as_secs()));
+    (
+        StatusCode::OK,
+        headers_out,
+        Json(json!({ "token": token, "username": username, "expiresIn": ttl.as_secs() }))
+    )
 }
 
 async fn viewer_me(
@@ -1868,6 +2010,12 @@ async fn viewer_me(
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
     };
     (StatusCode::OK, Json(json!({ "username": username })))
+}
+
+async fn viewer_logout() -> impl IntoResponse {
+    let mut headers_out = HeaderMap::new();
+    append_cookie(&mut headers_out, clear_cookie(VIEWER_COOKIE));
+    (StatusCode::OK, headers_out, Json(json!({ "ok": true })))
 }
 
 async fn viewer_profile_get(
@@ -2221,13 +2369,7 @@ fn broadcast(state: &AppState, event: &str, data: &Value) {
 }
 
 async fn check_bearer(headers: &HeaderMap, state: &AppState) -> bool {
-    let token = headers
-        .get("authorization")
-        .and_then(|val| val.to_str().ok())
-        .and_then(|val| val.strip_prefix("Bearer "))
-        .map(|val| val.to_string());
-
-    let Some(token) = token else { return false };
+    let Some(token) = token_from_headers(headers, ADMIN_COOKIE) else { return false };
 
     let mut tokens = state.tokens.write().await;
     let now = Instant::now();
@@ -2322,13 +2464,7 @@ async fn load_cf_access_jwks(state: &AppState) -> Option<Vec<CfAccessJwk>> {
 }
 
 async fn viewer_from_header(headers: &HeaderMap, state: &AppState) -> Option<String> {
-    let token = headers
-        .get("authorization")
-        .and_then(|val| val.to_str().ok())
-        .and_then(|val| val.strip_prefix("Bearer "))
-        .map(|val| val.to_string());
-
-    let Some(token) = token else { return None };
+    let Some(token) = token_from_headers(headers, VIEWER_COOKIE) else { return None };
 
     let mut tokens = state.viewer_tokens.write().await;
     let now = Instant::now();
@@ -2343,13 +2479,7 @@ async fn viewer_from_header(headers: &HeaderMap, state: &AppState) -> Option<Str
 }
 
 async fn viewer_session_from_header(headers: &HeaderMap, state: &AppState) -> Option<(String, String)> {
-    let token = headers
-        .get("authorization")
-        .and_then(|val| val.to_str().ok())
-        .and_then(|val| val.strip_prefix("Bearer "))
-        .map(|val| val.to_string());
-
-    let Some(token) = token else { return None };
+    let Some(token) = token_from_headers(headers, VIEWER_COOKIE) else { return None };
 
     let mut tokens = state.viewer_tokens.write().await;
     let now = Instant::now();
@@ -2357,14 +2487,20 @@ async fn viewer_session_from_header(headers: &HeaderMap, state: &AppState) -> Op
     tokens.get(&token).map(|session| (token.clone(), session.username.clone()))
 }
 
-async fn issue_viewer_token(state: &AppState, username: String, is_host: bool) -> String {
+async fn issue_viewer_token(
+    state: &AppState,
+    username: String,
+    is_host: bool,
+    ttl_override: Option<Duration>,
+) -> String {
     let token = generate_key();
     let mut tokens = state.viewer_tokens.write().await;
+    let ttl = ttl_override.unwrap_or(state.viewer_token_ttl);
     tokens.insert(
         token.clone(),
         ViewerSession {
             username,
-            expires_at: Instant::now() + state.viewer_token_ttl,
+            expires_at: Instant::now() + ttl,
             is_host,
         },
     );
@@ -2625,6 +2761,70 @@ fn set_opt(obj: &mut serde_json::Map<String, Value>, key: &str, value: Option<St
     }
 }
 
+fn get_template_value<'a>(templates: &'a Value, kind: &str) -> Option<&'a Value> {
+    templates.get(kind).and_then(|val| val.as_object()).map(|_| templates.get(kind).unwrap())
+}
+
+fn render_template(template: &str, ctx: &HashMap<String, String>, captures: Option<&regex::Captures>) -> String {
+    let mut out = template.to_string();
+    for (key, value) in ctx {
+        out = out.replace(&format!("{{{key}}}"), value);
+    }
+    if let Some(caps) = captures {
+        for idx in 1..caps.len() {
+            if let Some(value) = caps.get(idx).map(|m| m.as_str()) {
+                out = out.replace(&format!("${idx}"), value);
+            }
+        }
+    }
+    out
+}
+
+fn resolve_notify_template(
+    templates: &Value,
+    kind: &str,
+    ctx: &HashMap<String, String>,
+    fallback_title: &str,
+    fallback_message: &str,
+    fallback_url: &str,
+) -> (String, String, String) {
+    if let Some(rules) = templates.get("rules").and_then(|v| v.as_array()) {
+        for rule in rules {
+            let rule_kind = rule.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if rule_kind != kind {
+                continue;
+            }
+            let field = rule.get("field").and_then(|v| v.as_str()).unwrap_or("title");
+            let pattern = rule.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let target = ctx.get(field).cloned().unwrap_or_default();
+            if pattern.is_empty() {
+                continue;
+            }
+            if let Ok(re) = regex::Regex::new(pattern) {
+                if let Some(caps) = re.captures(&target) {
+                    let title_tpl = rule.get("title").and_then(|v| v.as_str()).unwrap_or(fallback_title);
+                    let msg_tpl = rule.get("message").and_then(|v| v.as_str()).unwrap_or(fallback_message);
+                    let url_tpl = rule.get("url").and_then(|v| v.as_str()).unwrap_or(fallback_url);
+                    return (
+                        render_template(title_tpl, ctx, Some(&caps)),
+                        render_template(msg_tpl, ctx, Some(&caps)),
+                        render_template(url_tpl, ctx, Some(&caps)),
+                    );
+                }
+            }
+        }
+    }
+    let tpl = get_template_value(templates, kind);
+    let title_tpl = tpl.and_then(|v| v.get("title")).and_then(|v| v.as_str()).unwrap_or(fallback_title);
+    let msg_tpl = tpl.and_then(|v| v.get("message")).and_then(|v| v.as_str()).unwrap_or(fallback_message);
+    let url_tpl = tpl.and_then(|v| v.get("url")).and_then(|v| v.as_str()).unwrap_or(fallback_url);
+    (
+        render_template(title_tpl, ctx, None),
+        render_template(msg_tpl, ctx, None),
+        render_template(url_tpl, ctx, None),
+    )
+}
+
 fn normalize_telegram_chat_id(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2650,6 +2850,45 @@ fn normalize_telegram_chat_id(raw: &str) -> Option<String> {
         return None;
     }
     Some(format!("@{segment}"))
+}
+
+fn token_from_headers(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
+    if let Some(token) = headers
+        .get("authorization")
+        .and_then(|val| val.to_str().ok())
+        .and_then(|val| val.strip_prefix("Bearer "))
+        .map(|val| val.to_string())
+    {
+        return Some(token);
+    }
+    let cookie_header = headers.get("cookie").and_then(|val| val.to_str().ok())?;
+    for part in cookie_header.split(';') {
+        let trimmed = part.trim();
+        let Some((name, value)) = trimmed.split_once('=') else { continue };
+        if name == cookie_name {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn build_cookie(name: &str, value: &str, max_age_secs: u64) -> String {
+    format!(
+        "{name}={value}; Path=/; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax"
+    )
+}
+
+fn clear_cookie(name: &str) -> String {
+    format!("{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+}
+
+fn append_cookie(headers: &mut HeaderMap, cookie: String) {
+    if let Ok(value) = cookie.parse() {
+        headers.append(SET_COOKIE, value);
+    }
 }
 
 async fn send_telegram_message(token: &str, chat_id: &str, text: &str) -> Result<(), String> {
@@ -2684,11 +2923,59 @@ async fn push_notification(state: &AppState, kind: &str, title: &str, message: &
         items = json!([]);
     }
     let list = items.as_array_mut().unwrap();
+    let templates = get_json(&state.pool, "notify_templates", default_notify_templates()).await;
+    let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
+    let schedule = get_json(&state.pool, "schedule", default_kv()[4].1.clone()).await;
+    let live_url = templates
+        .get("live_url")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| state.public_base_url.clone());
+    let stream_title = stream.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let stream_host = stream.get("host").and_then(|v| v.as_str()).unwrap_or("");
+    let stream_room = stream.get("roomId").and_then(|v| v.as_str()).unwrap_or("");
+    let stream_status = stream.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let (schedule_time, schedule_title, schedule_host) = schedule
+        .as_array()
+        .and_then(|arr| arr.first())
+        .map(|first| {
+            (
+                first.get("time").and_then(|v| v.as_str()).unwrap_or(""),
+                first.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                first.get("host").and_then(|v| v.as_str()).unwrap_or(""),
+            )
+        })
+        .unwrap_or(("", "", ""));
+    let mut ctx = HashMap::new();
+    ctx.insert("title".to_string(), stream_title.to_string());
+    ctx.insert("host".to_string(), stream_host.to_string());
+    ctx.insert("roomId".to_string(), stream_room.to_string());
+    ctx.insert("status".to_string(), stream_status.to_string());
+    ctx.insert("time".to_string(), now_iso());
+    ctx.insert("liveUrl".to_string(), live_url.clone());
+    ctx.insert("scheduleTime".to_string(), schedule_time.to_string());
+    ctx.insert("scheduleTitle".to_string(), schedule_title.to_string());
+    ctx.insert("scheduleHost".to_string(), schedule_host.to_string());
+    let (title, message, url) = resolve_notify_template(
+        &templates,
+        kind,
+        &ctx,
+        title,
+        message,
+        "",
+    );
+    let mut final_message = message;
+    let final_url = if !url.is_empty() { url } else if kind == "live" { live_url } else { String::new() };
+    if !final_url.is_empty() && !final_message.contains(&final_url) && !final_message.contains("{liveUrl}") {
+        final_message = format!("{final_message}\n\n观看地址：{final_url}");
+    }
     list.push(json!({
         "id": now_ts(),
         "type": kind,
         "title": title,
-        "message": message,
+        "message": final_message,
+        "url": final_url,
         "createdAt": now_iso()
     }));
     if list.len() > 50 {
@@ -2703,7 +2990,8 @@ async fn push_notification(state: &AppState, kind: &str, title: &str, message: &
 
     let kind = kind.to_string();
     let title = title.to_string();
-    let message = message.to_string();
+    let message = final_message.to_string();
+    let url = final_url.to_string();
     let pool = state.pool.clone();
     let smtp = state.smtp.read().await.clone();
     let telegram_bot_token = state.telegram_bot_token.clone();
@@ -2749,7 +3037,10 @@ async fn push_notification(state: &AppState, kind: &str, title: &str, message: &
             let channel_raw = get_json(&pool, "telegram_channel", json!("")).await;
             let channel = channel_raw.as_str().unwrap_or("");
             if let Some(chat_id) = normalize_telegram_chat_id(channel) {
-                let text = format!("{title}\n{message}\n\n时间：{time}", time = now_iso());
+                let mut text = format!("{title}\n{message}\n\n时间：{time}", time = now_iso());
+                if !url.is_empty() && !text.contains(&url) {
+                    text = format!("{text}\n{url}");
+                }
                 let _ = send_telegram_message(token, &chat_id, &text).await;
             }
         }

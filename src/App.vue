@@ -16,14 +16,30 @@ const history = ref({
   bitrate: [],
   latency: []
 });
-const adminToken = ref(localStorage.getItem("live_admin_token") || "");
-const adminViewerToken = ref(localStorage.getItem("viewer_token") || "");
-const adminUser = ref("");
-const adminPass = ref("");
+const loadStoredToken = (tokenKey, expiresKey, identityKey) => {
+  const token = localStorage.getItem(tokenKey) || "";
+  const expiresAt = Number(localStorage.getItem(expiresKey) || 0);
+  if (token && expiresAt && Date.now() > expiresAt) {
+    localStorage.removeItem(tokenKey);
+    localStorage.removeItem(expiresKey);
+    if (identityKey) localStorage.removeItem(identityKey);
+    return "";
+  }
+  return token;
+};
+
+const adminToken = ref(loadStoredToken("live_admin_token", "live_admin_token_expires_at", "live_admin_identity"));
+const adminViewerToken = ref(loadStoredToken("viewer_token", "viewer_token_expires_at", "viewer_identity"));
+const adminUser = ref(localStorage.getItem("live_admin_user") || "");
+const adminPass = ref(localStorage.getItem("live_admin_pass") || "");
+const adminRememberUser = ref(!!localStorage.getItem("live_admin_user"));
+const adminRememberPass = ref(!!localStorage.getItem("live_admin_pass"));
+const adminRememberDays = ref(Number(localStorage.getItem("live_admin_remember_days") || 0) || 0);
 const adminIdentity = ref(localStorage.getItem("live_admin_identity") || "");
 const adminSaving = ref(false);
 const actionNotice = ref("");
-const isAuthed = computed(() => !!adminToken.value);
+const adminSessionOk = ref(false);
+const isAuthed = computed(() => !!adminToken.value || adminSessionOk.value);
 const cfAccessEnabled = ref(false);
 const smtpConfig = ref({
   host: "",
@@ -45,6 +61,16 @@ const telegramConfig = ref({
 });
 const telegramSaving = ref(false);
 const telegramNotice = ref("");
+const notifyTemplates = ref({
+  live: { title: "", message: "", url: "" },
+  offline: { title: "", message: "", url: "" },
+  schedule: { title: "", message: "", url: "" },
+  live_url: "",
+  rules: []
+});
+const notifyRulesRaw = ref("[]");
+const notifySaving = ref(false);
+const notifyNotice = ref("");
 const antiAbuseConfig = ref({
   verifyEmailRateLimitWindowSecs: 1800,
   verifyEmailRateLimitMax: 3,
@@ -129,8 +155,10 @@ const fetchJson = async (url) => {
 const clearAdminSession = (notice) => {
   adminToken.value = "";
   localStorage.removeItem("live_admin_token");
+  localStorage.removeItem("live_admin_token_expires_at");
   adminIdentity.value = "";
   localStorage.removeItem("live_admin_identity");
+  adminSessionOk.value = false;
   if (ws) {
     ws.close();
     ws = null;
@@ -432,10 +460,6 @@ let ws = null;
 let reconnectTimer = null;
 
 const adminFetch = async (url, payload) => {
-  if (!adminToken.value) {
-    actionNotice.value = "请先登录管理员";
-    return false;
-  }
   adminSaving.value = true;
   actionNotice.value = "";
   try {
@@ -444,7 +468,7 @@ const adminFetch = async (url, payload) => {
       method: "POST",
       headers: {
         ...(hasBody ? { "Content-Type": "application/json" } : {}),
-        authorization: `Bearer ${adminToken.value}`
+        ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
       },
       body: hasBody ? JSON.stringify(payload) : undefined
     });
@@ -456,6 +480,7 @@ const adminFetch = async (url, payload) => {
       const text = await res.text();
       throw new Error(text || `请求失败 ${res.status}`);
     }
+    adminSessionOk.value = true;
     actionNotice.value = "操作成功";
     loadAll();
     return true;
@@ -488,7 +513,8 @@ const loginAdmin = async () => {
       body: JSON.stringify({
         username: adminUser.value,
         password: adminPass.value,
-        turnstileToken: adminTurnstileToken.value
+        turnstileToken: adminTurnstileToken.value,
+        rememberDays: adminRememberDays.value || undefined
       })
     });
     if (!res.ok) {
@@ -498,14 +524,36 @@ const loginAdmin = async () => {
     const data = await res.json();
     adminToken.value = data.token;
     localStorage.setItem("live_admin_token", data.token);
+    if (data.expiresIn) {
+      localStorage.setItem("live_admin_token_expires_at", String(Date.now() + Number(data.expiresIn) * 1000));
+    }
     adminIdentity.value = adminUser.value.trim();
     localStorage.setItem("live_admin_identity", adminIdentity.value);
     if (data.viewerToken) {
       localStorage.setItem("viewer_token", data.viewerToken);
       localStorage.setItem("viewer_identity", data.viewerName || adminIdentity.value);
       adminViewerToken.value = data.viewerToken;
+      if (data.expiresIn) {
+        localStorage.setItem("viewer_token_expires_at", String(Date.now() + Number(data.expiresIn) * 1000));
+      }
+    }
+    if (adminRememberUser.value) {
+      localStorage.setItem("live_admin_user", adminUser.value.trim());
+    } else {
+      localStorage.removeItem("live_admin_user");
+    }
+    if (adminRememberPass.value) {
+      localStorage.setItem("live_admin_pass", adminPass.value);
+    } else {
+      localStorage.removeItem("live_admin_pass");
+    }
+    if (adminRememberDays.value) {
+      localStorage.setItem("live_admin_remember_days", String(adminRememberDays.value));
+    } else {
+      localStorage.removeItem("live_admin_remember_days");
     }
     adminPass.value = "";
+    adminSessionOk.value = true;
     actionNotice.value = "已登录";
     enterAdmin();
     adminTurnstileToken.value = "";
@@ -521,15 +569,21 @@ const loginAdmin = async () => {
   }
 };
 
-const logoutAdmin = () => {
+const logoutAdmin = async () => {
+  try {
+    await fetch(apiUrl("/api/admin/logout"), { method: "POST" });
+  } catch {
+    // ignore
+  }
   clearAdminSession("已退出");
 };
 
 const loadSmtp = async () => {
-  if (!adminToken.value) return;
   try {
     const res = await fetch(apiUrl("/api/admin/smtp"), {
-      headers: { authorization: `Bearer ${adminToken.value}` }
+      headers: {
+        ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
+      }
     });
     if (res.status === 401) {
       clearAdminSession("登录已失效，请重新登录");
@@ -554,11 +608,28 @@ const loadSmtp = async () => {
   }
 };
 
+const loadAdminSession = async () => {
+  try {
+    const res = await fetch(apiUrl("/api/admin/me"), {
+      headers: {
+        ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
+      }
+    });
+    if (!res.ok) return;
+    adminSessionOk.value = true;
+    if (!adminIdentity.value) adminIdentity.value = "已登录";
+    enterAdmin();
+  } catch {
+    // ignore
+  }
+};
+
 const loadTelegram = async () => {
-  if (!adminToken.value) return;
   try {
     const res = await fetch(apiUrl("/api/admin/telegram/channel"), {
-      headers: { authorization: `Bearer ${adminToken.value}` }
+      headers: {
+        ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
+      }
     });
     if (res.status === 401) {
       clearAdminSession("登录已失效，请重新登录");
@@ -575,8 +646,79 @@ const loadTelegram = async () => {
   }
 };
 
+const loadNotifyTemplates = async () => {
+  try {
+    const res = await fetch(apiUrl("/api/admin/notify-templates"), {
+      headers: {
+        ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
+      }
+    });
+    if (res.status === 401) {
+      clearAdminSession("登录已失效，请重新登录");
+      return;
+    }
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data?.data) {
+      notifyTemplates.value = {
+        live: data.data.live || notifyTemplates.value.live,
+        offline: data.data.offline || notifyTemplates.value.offline,
+        schedule: data.data.schedule || notifyTemplates.value.schedule,
+        live_url: data.data.live_url || "",
+        rules: data.data.rules || []
+      };
+      notifyRulesRaw.value = JSON.stringify(notifyTemplates.value.rules || [], null, 2);
+    }
+  } catch {
+    // ignore
+  }
+};
+
+const saveNotifyTemplates = async () => {
+  notifySaving.value = true;
+  notifyNotice.value = "";
+  try {
+    let rules = [];
+    if (notifyRulesRaw.value.trim()) {
+      rules = JSON.parse(notifyRulesRaw.value);
+      if (!Array.isArray(rules)) throw new Error("规则必须是数组 JSON");
+    }
+    const payload = {
+      live: notifyTemplates.value.live,
+      offline: notifyTemplates.value.offline,
+      schedule: notifyTemplates.value.schedule,
+      live_url: notifyTemplates.value.live_url || "",
+      rules
+    };
+    const res = await fetch(apiUrl("/api/admin/notify-templates"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
+      },
+      body: JSON.stringify(payload)
+    });
+    if (res.status === 401) {
+      clearAdminSession("登录已失效，请重新登录");
+      return;
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || "保存失败");
+    }
+    notifyNotice.value = "通知模板已保存";
+    loadNotifyTemplates();
+  } catch (err) {
+    notifyNotice.value = err instanceof Error ? err.message : "保存失败";
+  } finally {
+    notifySaving.value = false;
+    setTimeout(() => {
+      notifyNotice.value = "";
+    }, 2000);
+  }
+};
+
 const saveTelegram = async () => {
-  if (!adminToken.value) return;
   telegramSaving.value = true;
   telegramNotice.value = "";
   try {
@@ -584,7 +726,7 @@ const saveTelegram = async () => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        authorization: `Bearer ${adminToken.value}`
+        ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
       },
       body: JSON.stringify({
         channel: telegramConfig.value.channel
@@ -622,7 +764,8 @@ const loginAdminAccess = async () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        turnstileToken: adminTurnstileToken.value
+        turnstileToken: adminTurnstileToken.value,
+        rememberDays: adminRememberDays.value || undefined
       })
     });
     if (!res.ok) {
@@ -632,13 +775,25 @@ const loginAdminAccess = async () => {
     const data = await res.json();
     adminToken.value = data.token;
     localStorage.setItem("live_admin_token", data.token);
+    if (data.expiresIn) {
+      localStorage.setItem("live_admin_token_expires_at", String(Date.now() + Number(data.expiresIn) * 1000));
+    }
     adminIdentity.value = "Cloudflare Access";
     localStorage.setItem("live_admin_identity", adminIdentity.value);
     if (data.viewerToken) {
       localStorage.setItem("viewer_token", data.viewerToken);
       localStorage.setItem("viewer_identity", data.viewerName || "主播");
       adminViewerToken.value = data.viewerToken;
+      if (data.expiresIn) {
+        localStorage.setItem("viewer_token_expires_at", String(Date.now() + Number(data.expiresIn) * 1000));
+      }
     }
+    if (adminRememberDays.value) {
+      localStorage.setItem("live_admin_remember_days", String(adminRememberDays.value));
+    } else {
+      localStorage.removeItem("live_admin_remember_days");
+    }
+    adminSessionOk.value = true;
     actionNotice.value = "已登录";
     enterAdmin();
     adminTurnstileToken.value = "";
@@ -655,10 +810,11 @@ const loginAdminAccess = async () => {
 };
 
 const loadViewerAntiAbuse = async () => {
-  if (!adminToken.value) return;
   try {
     const res = await fetch(apiUrl("/api/admin/viewer-anti-abuse"), {
-      headers: { authorization: `Bearer ${adminToken.value}` }
+      headers: {
+        ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
+      }
     });
     if (res.status === 401) {
       clearAdminSession("登录已失效，请重新登录");
@@ -681,7 +837,6 @@ const loadViewerAntiAbuse = async () => {
 };
 
 const saveViewerAntiAbuse = async () => {
-  if (!adminToken.value) return;
   antiAbuseSaving.value = true;
   antiAbuseNotice.value = "";
   try {
@@ -698,7 +853,7 @@ const saveViewerAntiAbuse = async () => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        authorization: `Bearer ${adminToken.value}`
+        ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
       },
       body: JSON.stringify(payload)
     });
@@ -722,7 +877,6 @@ const saveViewerAntiAbuse = async () => {
 };
 
 const saveSmtp = async () => {
-  if (!adminToken.value) return;
   smtpSaving.value = true;
   smtpNotice.value = "";
   try {
@@ -739,7 +893,7 @@ const saveSmtp = async () => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        authorization: `Bearer ${adminToken.value}`
+        ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
       },
       body: JSON.stringify(payload)
     });
@@ -776,7 +930,7 @@ const sendSmtpTest = async () => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        authorization: `Bearer ${adminToken.value}`
+        ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
       },
       body: JSON.stringify({ to: smtpTestTo.value.trim() })
     });
@@ -827,6 +981,7 @@ const enterAdmin = () => {
   loadAll();
   loadSmtp();
   loadTelegram();
+  loadNotifyTemplates();
   loadViewerAntiAbuse();
   connectWs();
   if (!refreshTimer) {
@@ -950,7 +1105,9 @@ onMounted(() => {
   if (adminToken.value) {
     enterAdmin();
   } else {
-    loading.value = false;
+    loadAdminSession().finally(() => {
+      if (!isAuthed.value) loading.value = false;
+    });
   }
 });
 
@@ -1078,6 +1235,16 @@ onBeforeUnmount(() => {
                 <label class="field-label">人机验证</label>
                 <div ref="adminTurnstileRef"></div>
               </div>
+              <div class="field-group">
+                <label class="field-label">保持登录</label>
+                <div class="flex flex-wrap items-center gap-3 text-xs">
+                  <select v-model="adminRememberDays" class="field-input !h-8 !text-xs w-[140px]">
+                    <option :value="0">默认时长</option>
+                    <option :value="7">保持 7 天</option>
+                    <option :value="30">保持 30 天</option>
+                  </select>
+                </div>
+              </div>
               <div class="flex flex-wrap gap-2">
                 <button class="meow-btn-primary motion-press" type="button" :disabled="adminSaving || !adminTurnstileToken" @click="loginAdminAccess">
                   进入管理端
@@ -1093,6 +1260,24 @@ onBeforeUnmount(() => {
               <div class="field-group">
                 <label class="field-label">管理员密码</label>
                 <input v-model="adminPass" class="field-input" type="password" placeholder="••••••••" />
+              </div>
+              <div class="field-group">
+                <label class="field-label">登录保持</label>
+                <div class="flex flex-wrap items-center gap-3 text-xs">
+                  <label class="meow-pill motion-press">
+                    <input type="checkbox" class="mr-2" v-model="adminRememberUser" />
+                    记住账号
+                  </label>
+                  <label class="meow-pill motion-press">
+                    <input type="checkbox" class="mr-2" v-model="adminRememberPass" />
+                    记住密码（仅本机）
+                  </label>
+                  <select v-model="adminRememberDays" class="field-input !h-8 !text-xs w-[140px]">
+                    <option :value="0">默认时长</option>
+                    <option :value="7">保持 7 天</option>
+                    <option :value="30">保持 30 天</option>
+                  </select>
+                </div>
               </div>
               <div class="field-group">
                 <label class="field-label">人机验证</label>
@@ -1147,6 +1332,7 @@ onBeforeUnmount(() => {
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#dashboard">控制台</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#ingest">推流配置</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#smtp">SMTP</a>
+            <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#notify">通知</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#anti-abuse">防盗刷</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#schedule">排期</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#channels">频道</a>
@@ -1659,6 +1845,83 @@ onBeforeUnmount(() => {
                 </button>
               </div>
               <span v-if="smtpNotice" class="text-xs text-[#e06b8b]">{{ smtpNotice }}</span>
+            </div>
+          </div>
+        </section>
+
+        <section id="notify" class="mt-14">
+          <div
+            class="meow-card motion-card p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex items-center justify-between gap-4">
+              <div>
+                <h3 class="font-display text-xl">通知模板</h3>
+                <p class="mt-2 text-sm" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  支持占位符与正则规则，自动拼接直播地址。
+                </p>
+              </div>
+              <button class="meow-btn-ghost motion-press" type="button" @click="loadNotifyTemplates">
+                刷新
+              </button>
+            </div>
+            <div class="mt-5 grid gap-4 md:grid-cols-2">
+              <div class="field-group">
+                <label class="field-label">直播地址（liveUrl）</label>
+                <input v-model="notifyTemplates.live_url" class="field-input" placeholder="https://live.example.com" />
+              </div>
+            </div>
+            <div class="mt-5 grid gap-4 md:grid-cols-3">
+              <div class="field-group">
+                <label class="field-label">开播标题</label>
+                <input v-model="notifyTemplates.live.title" class="field-input" placeholder="主播已开播" />
+              </div>
+              <div class="field-group md:col-span-2">
+                <label class="field-label">开播内容</label>
+                <textarea v-model="notifyTemplates.live.message" class="field-input min-h-[80px]" placeholder="直播间已开始：{title}"></textarea>
+              </div>
+              <div class="field-group">
+                <label class="field-label">开播 URL（可选）</label>
+                <input v-model="notifyTemplates.live.url" class="field-input" placeholder="{liveUrl}" />
+              </div>
+            </div>
+            <div class="mt-4 grid gap-4 md:grid-cols-3">
+              <div class="field-group">
+                <label class="field-label">下播标题</label>
+                <input v-model="notifyTemplates.offline.title" class="field-input" placeholder="主播已下播" />
+              </div>
+              <div class="field-group md:col-span-2">
+                <label class="field-label">下播内容</label>
+                <textarea v-model="notifyTemplates.offline.message" class="field-input min-h-[80px]" placeholder="直播已结束：{title}"></textarea>
+              </div>
+              <div class="field-group">
+                <label class="field-label">下播 URL（可选）</label>
+                <input v-model="notifyTemplates.offline.url" class="field-input" placeholder="" />
+              </div>
+            </div>
+            <div class="mt-4 grid gap-4 md:grid-cols-3">
+              <div class="field-group">
+                <label class="field-label">排期标题</label>
+                <input v-model="notifyTemplates.schedule.title" class="field-input" placeholder="排期已更新" />
+              </div>
+              <div class="field-group md:col-span-2">
+                <label class="field-label">排期内容</label>
+                <textarea v-model="notifyTemplates.schedule.message" class="field-input min-h-[80px]" placeholder="下一场：{scheduleTime} {scheduleTitle}"></textarea>
+              </div>
+              <div class="field-group">
+                <label class="field-label">排期 URL（可选）</label>
+                <input v-model="notifyTemplates.schedule.url" class="field-input" placeholder="" />
+              </div>
+            </div>
+            <div class="mt-4 field-group">
+              <label class="field-label">规则（JSON 数组）</label>
+              <textarea v-model="notifyRulesRaw" class="field-input min-h-[140px]" placeholder='[{ "kind": "live", "field": "title", "pattern": "(.*)", "title": "开播：$1", "message": "标题：$1 {liveUrl}" }]'></textarea>
+            </div>
+            <div class="mt-4 flex flex-wrap items-center gap-3">
+              <button class="meow-btn-primary motion-press" type="button" :disabled="notifySaving" @click="saveNotifyTemplates">
+                保存模板
+              </button>
+              <span v-if="notifyNotice" class="text-xs text-[#e06b8b]">{{ notifyNotice }}</span>
             </div>
           </div>
         </section>

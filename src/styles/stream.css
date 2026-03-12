@@ -1074,6 +1074,36 @@
   color: rgba(214, 198, 255, 0.92);
 }
 
+.mobile-notify-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 35;
+  display: grid;
+  place-items: end center;
+  padding: 16px;
+  background: rgba(12, 14, 24, 0.45);
+  backdrop-filter: blur(6px);
+}
+
+.mobile-notify-card {
+  width: min(560px, 94vw);
+  max-height: 78vh;
+  overflow: auto;
+  border-radius: 18px;
+  padding: 16px;
+  border: 1px solid rgba(233, 217, 234, 0.7);
+  box-shadow: 0 20px 50px rgba(24, 20, 40, 0.35);
+}
+
+.mobile-notify-day {
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.mobile-notify-night {
+  background: rgba(24, 26, 44, 0.9);
+  border-color: rgba(120, 136, 200, 0.35);
+}
+
 @media (min-width: 640px) {
   .chat-input {
     grid-template-columns: 1fr auto;
