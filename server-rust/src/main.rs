@@ -426,6 +426,7 @@ async fn main() {
     let pool = create_pool().await;
     ensure_tables(&pool).await;
     ensure_defaults(&pool).await;
+    migrate_viewer_accounts(&pool).await;
     let smtp = load_smtp_config_db(&pool).await.or_else(load_smtp_config);
 
     let (tx, _rx) = broadcast::channel::<String>(64);
@@ -677,6 +678,23 @@ async fn ensure_tables(pool: &MySqlPool) {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS viewer_users (
+          id BIGINT PRIMARY KEY AUTO_INCREMENT,
+          username VARCHAR(64) NOT NULL,
+          email VARCHAR(190) NOT NULL,
+          password_hash VARCHAR(128) NOT NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY uniq_viewer_username (username),
+          UNIQUE KEY uniq_viewer_email (email)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("create viewer_users failed");
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS clips (
           id VARCHAR(32) PRIMARY KEY,
           created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -723,6 +741,34 @@ async fn ensure_defaults(pool: &MySqlPool) {
             set_json(pool, &key, &value).await;
         }
     }
+}
+
+async fn migrate_viewer_accounts(pool: &MySqlPool) {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM viewer_users")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    if count > 0 {
+        return;
+    }
+    let raw = get_json(pool, "viewer_accounts", json!([])).await;
+    let accounts: Vec<ViewerAccount> = serde_json::from_value(raw).unwrap_or_default();
+    if accounts.is_empty() {
+        return;
+    }
+    let mut tx = pool.begin().await.expect("viewer_users tx");
+    for acc in accounts {
+        let _ = sqlx::query(
+            "INSERT IGNORE INTO viewer_users (username, email, password_hash, created_at) VALUES (?, ?, ?, ?)"
+        )
+        .bind(&acc.username)
+        .bind(&acc.email)
+        .bind(&acc.password_hash)
+        .bind(&acc.created_at)
+        .execute(&mut *tx)
+        .await;
+    }
+    tx.commit().await.expect("viewer_users tx commit");
 }
 
 async fn get_json(pool: &MySqlPool, key: &str, fallback: Value) -> Value {
@@ -3575,13 +3621,44 @@ async fn get_admin_accounts(pool: &MySqlPool) -> Vec<AdminAccount> {
 
 
 async fn get_viewer_accounts(pool: &MySqlPool) -> Vec<ViewerAccount> {
-    let raw = get_json(pool, "viewer_accounts", json!([])).await;
-    serde_json::from_value(raw).unwrap_or_default()
+    let rows = sqlx::query_as::<_, (String, String, String, String)>(
+        r#"
+        SELECT username, email, password_hash,
+               DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at
+        FROM viewer_users
+        ORDER BY id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows
+        .into_iter()
+        .map(|(username, email, password_hash, created_at)| ViewerAccount {
+            username,
+            email,
+            password_hash,
+            created_at,
+        })
+        .collect()
 }
 
 async fn save_viewer_accounts(pool: &MySqlPool, accounts: &Vec<ViewerAccount>) {
-    let payload = serde_json::to_value(accounts).unwrap_or_else(|_| json!([]));
-    set_json(pool, "viewer_accounts", &payload).await;
+    let mut tx = pool.begin().await.expect("viewer_users save tx");
+    sqlx::query("DELETE FROM viewer_users").execute(&mut *tx).await.expect("viewer_users delete");
+    for acc in accounts {
+        sqlx::query(
+            "INSERT INTO viewer_users (username, email, password_hash, created_at) VALUES (?, ?, ?, ?)"
+        )
+        .bind(&acc.username)
+        .bind(&acc.email)
+        .bind(&acc.password_hash)
+        .bind(&acc.created_at)
+        .execute(&mut *tx)
+        .await
+        .expect("viewer_users insert");
+    }
+    tx.commit().await.expect("viewer_users save commit");
 }
 
 fn normalize_username(name: &str) -> String {
