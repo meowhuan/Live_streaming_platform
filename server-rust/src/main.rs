@@ -137,13 +137,6 @@ struct ViewerAccount {
     created_at: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct ViewerSubscription {
-    live: bool,
-    schedule: bool,
-    email: bool,
-}
-
 struct PendingCode {
     code: String,
     expires_at: Instant,
@@ -2687,10 +2680,10 @@ struct ViewerSubscriptionPayload {
 
 async fn push_notification(state: &AppState, kind: &str, title: &str, message: &str) {
     let mut items = get_json(&state.pool, "notifications", json!([])).await;
-    let list = items.as_array_mut().unwrap_or_else(|| {
+    if !items.is_array() {
         items = json!([]);
-        items.as_array_mut().unwrap()
-    });
+    }
+    let list = items.as_array_mut().unwrap();
     list.push(json!({
         "id": now_ts(),
         "type": kind,
@@ -2702,9 +2695,10 @@ async fn push_notification(state: &AppState, kind: &str, title: &str, message: &
         let overflow = list.len() - 50;
         list.drain(0..overflow);
     }
+    let last = list.last().cloned();
     set_json(&state.pool, "notifications", &items).await;
-    if let Some(last) = list.last() {
-        broadcast(state, "notify:new", last);
+    if let Some(last) = last {
+        broadcast(state, "notify:new", &last);
     }
 
     let kind = kind.to_string();
@@ -2770,16 +2764,16 @@ async fn viewer_subscription_get(
     let Some((_token, username)) = session else {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
     };
-    let mut map = get_json(&state.pool, "viewer_subscriptions", json!({})).await;
+    let map = get_json(&state.pool, "viewer_subscriptions", json!({})).await;
     let entry = map
         .get(&username)
         .cloned()
         .unwrap_or_else(|| json!({ "live": false, "schedule": false, "email": false }));
-    Json(json!({
+    (StatusCode::OK, Json(json!({
         "live": entry.get("live").and_then(|v| v.as_bool()).unwrap_or(false),
         "schedule": entry.get("schedule").and_then(|v| v.as_bool()).unwrap_or(false),
         "email": entry.get("email").and_then(|v| v.as_bool()).unwrap_or(false)
-    }))
+    })))
 }
 
 async fn viewer_subscription_set(
@@ -2802,7 +2796,7 @@ async fn viewer_subscription_set(
         obj.insert(username.clone(), json!({ "live": live, "schedule": schedule, "email": email }));
     }
     set_json(&state.pool, "viewer_subscriptions", &map).await;
-    Json(json!({ "ok": true, "live": live, "schedule": schedule, "email": email }))
+    (StatusCode::OK, Json(json!({ "ok": true, "live": live, "schedule": schedule, "email": email })))
 }
 
 async fn verify_turnstile(state: &AppState, token: Option<String>) -> bool {
