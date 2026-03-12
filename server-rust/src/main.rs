@@ -3518,7 +3518,7 @@ fn normalize_username(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
-async fn reserved_usernames(state: &Arc<AppState>) -> HashSet<String> {
+async fn reserved_usernames(state: &AppState) -> HashSet<String> {
     let mut reserved = HashSet::new();
     reserved.insert(normalize_username("主播"));
     let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
@@ -3530,7 +3530,7 @@ async fn reserved_usernames(state: &Arc<AppState>) -> HashSet<String> {
     reserved
 }
 
-async fn is_reserved_username(state: &Arc<AppState>, username: &str) -> bool {
+async fn is_reserved_username(state: &AppState, username: &str) -> bool {
     let normalized = normalize_username(username);
     if normalized.is_empty() {
         return false;
@@ -3539,7 +3539,7 @@ async fn is_reserved_username(state: &Arc<AppState>, username: &str) -> bool {
     reserved.contains(&normalized)
 }
 
-async fn cleanup_duplicate_viewers(state: &Arc<AppState>) {
+async fn cleanup_duplicate_viewers(state: &AppState) {
     let accounts = get_viewer_accounts(&state.pool).await;
     if accounts.is_empty() {
         return;
