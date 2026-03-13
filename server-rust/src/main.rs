@@ -1304,7 +1304,10 @@ async fn get_stream_play(
     let read = ensure_read_token(&state).await;
     let webrtc_base = public_media_base(&state.mediamtx_webrtc, &headers);
     let hls_base = public_media_base(&state.mediamtx_hls, &headers);
-    let ll_hls = state.mediamtx_ll_hls.as_ref().map(|base| public_media_base(base, &headers));
+    let ll_hls = state
+        .mediamtx_ll_hls
+        .as_ref()
+        .map(|base| resolve_media_base(base, &hls_base, &headers));
     let whep = format!(
         "{}/{}/whep?token={}",
         webrtc_base.trim_end_matches('/'),
@@ -1318,12 +1321,13 @@ async fn get_stream_play(
         read
     );
     let ll_hls_url = ll_hls.map(|base| {
-        format!(
-            "{}/{}/index.m3u8?token={}",
-            base.trim_end_matches('/'),
-            state.mediamtx_path,
-            read
-        )
+        let trimmed = base.trim_end_matches('/');
+        let path_marker = format!("/{}/", state.mediamtx_path);
+        if trimmed.contains(&path_marker) || trimmed.ends_with(&format!("/{}", state.mediamtx_path)) {
+            format!("{}/index.m3u8?token={}", trimmed, read)
+        } else {
+            format!("{}/{}/index.m3u8?token={}", trimmed, state.mediamtx_path, read)
+        }
     });
     let mut modes = vec!["whep"];
     if ll_hls_url.is_some() {
@@ -1390,6 +1394,22 @@ fn public_media_base(base: &str, headers: &HeaderMap) -> String {
         format!("{scheme}://{rebuilt_host}")
     } else {
         format!("{scheme}://{rebuilt_host}/{base_path}")
+    }
+}
+
+fn resolve_media_base(base: &str, fallback_base: &str, headers: &HeaderMap) -> String {
+    let trimmed = base.trim();
+    if trimmed.is_empty() {
+        return public_media_base(fallback_base, headers);
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return public_media_base(trimmed, headers);
+    }
+    let fallback = public_media_base(fallback_base, headers).trim_end_matches('/').to_string();
+    if trimmed.starts_with('/') {
+        format!("{fallback}{trimmed}")
+    } else {
+        format!("{fallback}/{trimmed}")
     }
 }
 
