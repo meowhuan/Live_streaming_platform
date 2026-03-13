@@ -121,6 +121,8 @@ const replayExpanded = ref(false);
 const showMobileDrawer = ref(false);
 const showUnmutePrompt = ref(false);
 const unmuteTried = ref(false);
+const replayNotice = ref("");
+const replayWasWhep = ref(false);
 
 const normalizePlayUrl = (raw) => {
   if (!raw) return raw;
@@ -1017,7 +1019,28 @@ const resolveSeekableEnd = (video) => {
   return null;
 };
 
-const rewindPlayback = (seconds) => {
+const canReplay = computed(() => {
+  if (!replayInfo.value.enabled) return false;
+  return !!(replayInfo.value.hls || playInfo.value.llHls || playInfo.value.hls);
+});
+
+const ensureHlsForReplay = async () => {
+  if (activeMode.value === "hls" || activeMode.value === "ll-hls") return true;
+  replayWasWhep.value = activeMode.value === "whep";
+  const hlsUrl = replayInfo.value.hls || playInfo.value.llHls || playInfo.value.hls;
+  if (!hlsUrl) return false;
+  await startHls(hlsUrl, playInfo.value.llHls ? "ll-hls" : "hls");
+  if (replayWasWhep.value) {
+    replayNotice.value = "已进入回放模式（已切换为 HLS）";
+    setTimeout(() => {
+      replayNotice.value = "";
+    }, 2500);
+  }
+  return true;
+};
+
+const rewindPlayback = async (seconds) => {
+  if (!(await ensureHlsForReplay())) return;
   const video = videoRef.value;
   const end = resolveSeekableEnd(video);
   if (end === null) return;
@@ -1025,11 +1048,20 @@ const rewindPlayback = (seconds) => {
   video.currentTime = target;
 };
 
-const jumpLive = () => {
+const jumpLive = async () => {
+  if (!(await ensureHlsForReplay())) return;
   const video = videoRef.value;
   const end = resolveSeekableEnd(video);
   if (end === null) return;
   video.currentTime = end;
+  if (replayWasWhep.value && playInfo.value.whep && supportsWhep()) {
+    replayWasWhep.value = false;
+    await startWhep(playInfo.value.whep);
+    replayNotice.value = "已返回直播（切回 WHEP）";
+    setTimeout(() => {
+      replayNotice.value = "";
+    }, 2500);
+  }
 };
 
 const startWhep = async (url) => {
@@ -1413,7 +1445,7 @@ watch(isMobile, () => {
                     v-for="step in replayInfo.rewindSteps"
                     :key="`rewind-${step}`"
                     class="meow-pill motion-press"
-                    :disabled="!replayInfo.enabled || !(activeMode === 'hls' || activeMode === 'll-hls')"
+                    :disabled="!canReplay"
                     type="button"
                     @click="rewindPlayback(step)"
                   >
@@ -1421,7 +1453,7 @@ watch(isMobile, () => {
                   </button>
                   <button
                     class="meow-pill motion-press"
-                    :disabled="!replayInfo.enabled || !(activeMode === 'hls' || activeMode === 'll-hls')"
+                    :disabled="!canReplay"
                     type="button"
                     @click="jumpLive"
                   >
@@ -1582,7 +1614,7 @@ watch(isMobile, () => {
                         v-for="step in replayInfo.rewindSteps"
                         :key="`m-rewind-${step}`"
                         class="meow-pill motion-press"
-                        :disabled="!replayInfo.enabled || !(activeMode === 'hls' || activeMode === 'll-hls')"
+                        :disabled="!canReplay"
                         type="button"
                         @click="rewindPlayback(step)"
                       >
@@ -1590,7 +1622,7 @@ watch(isMobile, () => {
                       </button>
                       <button
                         class="meow-pill motion-press"
-                        :disabled="!replayInfo.enabled || !(activeMode === 'hls' || activeMode === 'll-hls')"
+                        :disabled="!canReplay"
                         type="button"
                         @click="jumpLive"
                       >
@@ -1605,6 +1637,7 @@ watch(isMobile, () => {
               </div>
             </div>
           </div>
+          <div v-if="replayNotice" class="replay-toast">{{ replayNotice }}</div>
           <div class="mobile-controls-placeholder"></div>
           <div v-if="playerError && !streamUnavailable" class="player-error mt-2 text-xs text-[#e06b8b]">{{ playerError }}</div>
           <div class="metrics-bar">

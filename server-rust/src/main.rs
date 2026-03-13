@@ -71,6 +71,7 @@ struct AppState {
     telegram_bot_token: Option<String>,
     chat_filter_words: Vec<String>,
     public_base_url: String,
+    live_count_fallback_secs: u64,
     stats_last_written: RwLock<Instant>,
     replay_max_seconds: u64,
     hls_segment_duration_secs: u64,
@@ -158,6 +159,7 @@ struct AdminAccount {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct ViewerAccount {
+    id: Option<i64>,
     email: String,
     username: String,
     password_hash: String,
@@ -173,6 +175,7 @@ struct ViewerSession {
     username: String,
     expires_at: Instant,
     is_host: bool,
+    user_id: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -422,11 +425,13 @@ async fn main() {
         .collect::<Vec<_>>();
     let viewer_token_ttl = Duration::from_secs(env_u64("VIEWER_TOKEN_DAYS", 30) * 24 * 3600);
     let viewer_anti_abuse_defaults = ViewerAntiAbuseConfig::from_env();
+    let live_count_fallback_secs = env_u64("LIVE_COUNT_FALLBACK_SECS", 3600);
 
     let pool = create_pool().await;
     ensure_tables(&pool).await;
     ensure_defaults(&pool).await;
     migrate_viewer_accounts(&pool).await;
+    backfill_chat_user_ids(&pool).await;
     let smtp = load_smtp_config_db(&pool).await.or_else(load_smtp_config);
 
     let (tx, _rx) = broadcast::channel::<String>(64);
@@ -464,6 +469,7 @@ async fn main() {
         telegram_bot_token,
         chat_filter_words,
         public_base_url,
+        live_count_fallback_secs,
         stats_last_written: RwLock::new(Instant::now() - Duration::from_secs(3600)),
         replay_max_seconds,
         hls_segment_duration_secs,
@@ -643,6 +649,12 @@ async fn ensure_tables(pool: &MySqlPool) {
     .await
     .expect("create chat table failed");
 
+    let _ = sqlx::query(
+        "ALTER TABLE chat_messages ADD COLUMN user_id BIGINT NULL, ADD INDEX idx_chat_user_id (user_id)"
+    )
+    .execute(pool)
+    .await;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS viewer_email_log (
@@ -769,6 +781,19 @@ async fn migrate_viewer_accounts(pool: &MySqlPool) {
         .await;
     }
     tx.commit().await.expect("viewer_users tx commit");
+}
+
+async fn backfill_chat_user_ids(pool: &MySqlPool) {
+    let _ = sqlx::query(
+        r#"
+        UPDATE chat_messages cm
+        JOIN viewer_users vu ON LOWER(cm.user) = LOWER(vu.username)
+        SET cm.user_id = vu.id
+        WHERE cm.user_id IS NULL
+        "#
+    )
+    .execute(pool)
+    .await;
 }
 
 async fn get_json(pool: &MySqlPool, key: &str, fallback: Value) -> Value {
@@ -1569,11 +1594,17 @@ async fn get_chat_latest(State(state): State<Arc<AppState>>) -> impl IntoRespons
         r#"
         SELECT
             cm.id,
-            cm.user,
+            COALESCE(v.username, cm.user) as user,
             cm.text,
             DATE_FORMAT(cm.created_at, '%Y-%m-%d %H:%i:%s') as created_at,
-            (SELECT COUNT(*) FROM chat_messages cm2 WHERE cm2.user = cm.user AND cm2.id <= cm.id) as msg_count
+            CASE
+                WHEN cm.user_id IS NOT NULL THEN
+                    (SELECT COUNT(*) FROM chat_messages cm2 WHERE cm2.user_id = cm.user_id AND cm2.id <= cm.id)
+                ELSE
+                    (SELECT COUNT(*) FROM chat_messages cm2 WHERE cm2.user = cm.user AND cm2.id <= cm.id)
+            END as msg_count
         FROM chat_messages cm
+        LEFT JOIN viewer_users v ON cm.user_id = v.id
         ORDER BY cm.id DESC
         LIMIT 50
         "#,
@@ -1622,14 +1653,21 @@ async fn get_chat_leaderboard(
 ) -> impl IntoResponse {
     let limit = query.limit.unwrap_or(10).min(100);
     let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
-    let started_at = stream.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    let mut started_at = stream.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    if started_at <= 0 {
+        started_at = now_ts() - state.live_count_fallback_secs as i64;
+    }
     let rows = sqlx::query_as::<_, (String, i64, i64)>(
         r#"
-        SELECT user,
+        SELECT
+               COALESCE(v.username, cm.user) AS display_user,
                COUNT(*) AS total_count,
-               SUM(created_at >= FROM_UNIXTIME(?)) AS live_count
-        FROM chat_messages
-        GROUP BY user
+               SUM(cm.created_at >= FROM_UNIXTIME(?)) AS live_count
+        FROM chat_messages cm
+        LEFT JOIN viewer_users v ON cm.user_id = v.id
+        GROUP BY
+          CASE WHEN cm.user_id IS NULL THEN CONCAT('u:', cm.user) ELSE CONCAT('id:', cm.user_id) END,
+          display_user
         ORDER BY total_count DESC
         LIMIT ?
         "#,
@@ -1665,7 +1703,7 @@ async fn post_chat_send(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "empty" })));
     }
 
-    let Some(viewer) = viewer_from_header(&headers, &state).await else {
+    let Some((_token, viewer, user_id)) = viewer_session_from_header(&headers, &state).await else {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "login_required" })));
     };
     let user = viewer;
@@ -1682,9 +1720,10 @@ async fn post_chat_send(
     }
 
     let result = sqlx::query(
-        "INSERT INTO chat_messages (user, text) VALUES (?, ?)"
+        "INSERT INTO chat_messages (user, user_id, text) VALUES (?, ?, ?)"
     )
     .bind(&user)
+    .bind(user_id)
     .bind(&text)
     .execute(&state.pool)
     .await;
@@ -1693,13 +1732,23 @@ async fn post_chat_send(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "db" })));
     }
 
-    let msg_count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM chat_messages WHERE user = ?"
-    )
-    .bind(&user)
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
+    let msg_count = if let Some(uid) = user_id {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM chat_messages WHERE user_id = ?"
+        )
+        .bind(uid)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0)
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM chat_messages WHERE user = ?"
+        )
+        .bind(&user)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0)
+    };
     let level = chat_level(msg_count);
     let msg = ChatMessage {
         id: result.unwrap().last_insert_id() as i64,
@@ -2529,7 +2578,7 @@ async fn admin_login(
     let mut tokens = state.tokens.write().await;
     tokens.insert(token.clone(), Instant::now() + ttl);
 
-    let viewer_token = issue_viewer_token(&state, payload.username.trim().to_string(), true, Some(ttl)).await;
+    let viewer_token = issue_viewer_token(&state, payload.username.trim().to_string(), true, None, Some(ttl)).await;
     let mut headers_out = HeaderMap::new();
     append_cookie(&mut headers_out, build_cookie(ADMIN_COOKIE, &token, ttl.as_secs()));
     append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &viewer_token, ttl.as_secs()));
@@ -2591,7 +2640,7 @@ async fn admin_turnstile_login(
     let mut tokens = state.tokens.write().await;
     tokens.insert(token.clone(), Instant::now() + ttl);
 
-    let viewer_token = issue_viewer_token(&state, "主播".to_string(), true, Some(ttl)).await;
+    let viewer_token = issue_viewer_token(&state, "主播".to_string(), true, None, Some(ttl)).await;
     let mut headers_out = HeaderMap::new();
     append_cookie(&mut headers_out, build_cookie(ADMIN_COOKIE, &token, ttl.as_secs()));
     append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &viewer_token, ttl.as_secs()));
@@ -3029,24 +3078,41 @@ async fn viewer_register_verify(
         return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "code" })));
     }
 
-    let mut accounts = get_viewer_accounts(&state.pool).await;
-    if accounts.iter().any(|acc| acc.email.eq_ignore_ascii_case(&email)) {
+    let email_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM viewer_users WHERE LOWER(email) = LOWER(?)"
+    )
+    .bind(&email)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    if email_exists > 0 {
         return (StatusCode::CONFLICT, HeaderMap::new(), Json(json!({ "error": "email_exists" })));
     }
-    if accounts.iter().any(|acc| acc.username.eq_ignore_ascii_case(username)) {
+    let name_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM viewer_users WHERE LOWER(username) = LOWER(?)"
+    )
+    .bind(username)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    if name_exists > 0 {
         return (StatusCode::CONFLICT, HeaderMap::new(), Json(json!({ "error": "username_exists" })));
     }
 
-    accounts.push(ViewerAccount {
-        email: email.clone(),
-        username: username.to_string(),
-        password_hash: hash_password(password),
-        created_at: now_iso(),
-    });
-    save_viewer_accounts(&state.pool, &accounts).await;
+    let created_at = now_iso();
+    let insert = sqlx::query(
+        "INSERT INTO viewer_users (username, email, password_hash, created_at) VALUES (?, ?, ?, ?)"
+    )
+    .bind(username)
+    .bind(&email)
+    .bind(hash_password(password))
+    .bind(&created_at)
+    .execute(&state.pool)
+    .await;
+    let user_id = insert.ok().map(|res| res.last_insert_id() as i64);
     pending.remove(&email);
 
-    let token = issue_viewer_token(&state, username.to_string(), false, None).await;
+    let token = issue_viewer_token(&state, username.to_string(), false, user_id, None).await;
     let mut headers_out = HeaderMap::new();
     append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &token, state.viewer_token_ttl.as_secs()));
     (
@@ -3063,26 +3129,31 @@ async fn viewer_login(
     if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
         return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "turnstile" })));
     }
-    let accounts = get_viewer_accounts(&state.pool).await;
     let username = payload.username.trim();
     let password_hash = hash_password(payload.password.trim());
-    let authed = accounts.iter().any(|account| {
-        (account.username.eq_ignore_ascii_case(username)
-            || account.email.eq_ignore_ascii_case(username))
-            && account.password_hash == password_hash
-    });
-    if !authed {
+    let row = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id, username, password_hash FROM viewer_users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?) LIMIT 1"
+    )
+    .bind(username)
+    .bind(username)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+    let Some((user_id, db_username, db_hash)) = row else {
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "invalid" })));
+    };
+    if db_hash != password_hash {
         return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "invalid" })));
     }
 
     let ttl = ttl_from_remember(state.viewer_token_ttl, payload.remember_days);
-    let token = issue_viewer_token(&state, username.to_string(), false, Some(ttl)).await;
+    let token = issue_viewer_token(&state, db_username.clone(), false, Some(user_id), Some(ttl)).await;
     let mut headers_out = HeaderMap::new();
     append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &token, ttl.as_secs()));
     (
         StatusCode::OK,
         headers_out,
-        Json(json!({ "token": token, "username": username, "expiresIn": ttl.as_secs() }))
+        Json(json!({ "token": token, "username": db_username, "expiresIn": ttl.as_secs() }))
     )
 }
 
@@ -3108,14 +3179,30 @@ async fn viewer_profile_get(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let session = viewer_session_from_header(&headers, &state).await;
-    let Some((_, username)) = session else {
+    let Some((_, username, user_id)) = session else {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
     };
-    let accounts = get_viewer_accounts(&state.pool).await;
-    let Some(account) = accounts.iter().find(|acc| acc.username.eq_ignore_ascii_case(&username)) else {
+    let row = if let Some(uid) = user_id {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT username, email FROM viewer_users WHERE id = ? LIMIT 1"
+        )
+        .bind(uid)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None)
+    } else {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT username, email FROM viewer_users WHERE LOWER(username) = LOWER(?) LIMIT 1"
+        )
+        .bind(&username)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None)
+    };
+    let Some((db_username, db_email)) = row else {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" })));
     };
-    (StatusCode::OK, Json(json!(ViewerProfile { username: account.username.clone(), email: account.email.clone() })))
+    (StatusCode::OK, Json(json!(ViewerProfile { username: db_username, email: db_email })))
 }
 
 async fn viewer_profile_update(
@@ -3124,7 +3211,7 @@ async fn viewer_profile_update(
     Json(payload): Json<ViewerProfileUpdate>,
 ) -> impl IntoResponse {
     let session = viewer_session_from_header(&headers, &state).await;
-    let Some((token, username)) = session else {
+    let Some((token, _username, user_id)) = session else {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
     };
     let next_username = payload.username.trim();
@@ -3135,20 +3222,41 @@ async fn viewer_profile_update(
     if is_reserved_username(&state, next_username).await {
         return (StatusCode::CONFLICT, Json(json!({ "error": "username_reserved" })));
     }
-    let mut accounts = get_viewer_accounts(&state.pool).await;
-    let Some(current_idx) = accounts.iter().position(|acc| acc.username.eq_ignore_ascii_case(&username)) else {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" })));
-    };
-    if accounts.iter().any(|acc| acc.username.eq_ignore_ascii_case(next_username) && !acc.username.eq_ignore_ascii_case(&username)) {
+    let uid = user_id.unwrap_or(0);
+    let name_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM viewer_users WHERE LOWER(username) = LOWER(?) AND id <> ?"
+    )
+    .bind(next_username)
+    .bind(uid)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    if name_exists > 0 {
         return (StatusCode::CONFLICT, Json(json!({ "error": "username_exists" })));
     }
-    if accounts.iter().any(|acc| acc.email.eq_ignore_ascii_case(&next_email) && !acc.username.eq_ignore_ascii_case(&username)) {
+    let email_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM viewer_users WHERE LOWER(email) = LOWER(?) AND id <> ?"
+    )
+    .bind(&next_email)
+    .bind(uid)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    if email_exists > 0 {
         return (StatusCode::CONFLICT, Json(json!({ "error": "email_exists" })));
     }
 
-    accounts[current_idx].username = next_username.to_string();
-    accounts[current_idx].email = next_email.clone();
-    save_viewer_accounts(&state.pool, &accounts).await;
+    let update = sqlx::query(
+        "UPDATE viewer_users SET username = ?, email = ? WHERE id = ?"
+    )
+    .bind(next_username)
+    .bind(&next_email)
+    .bind(uid)
+    .execute(&state.pool)
+    .await;
+    if update.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "db" })));
+    }
 
     let mut tokens = state.viewer_tokens.write().await;
     if let Some(session) = tokens.get_mut(&token) {
@@ -3396,11 +3504,17 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         r#"
         SELECT
             cm.id,
-            cm.user,
+            COALESCE(v.username, cm.user) as user,
             cm.text,
             DATE_FORMAT(cm.created_at, '%Y-%m-%d %H:%i:%s') as created_at,
-            (SELECT COUNT(*) FROM chat_messages cm2 WHERE cm2.user = cm.user AND cm2.id <= cm.id) as msg_count
+            CASE
+                WHEN cm.user_id IS NOT NULL THEN
+                    (SELECT COUNT(*) FROM chat_messages cm2 WHERE cm2.user_id = cm.user_id AND cm2.id <= cm.id)
+                ELSE
+                    (SELECT COUNT(*) FROM chat_messages cm2 WHERE cm2.user = cm.user AND cm2.id <= cm.id)
+            END as msg_count
         FROM chat_messages cm
+        LEFT JOIN viewer_users v ON cm.user_id = v.id
         ORDER BY cm.id DESC
         LIMIT 50
         "#
@@ -3585,19 +3699,33 @@ async fn viewer_from_header(headers: &HeaderMap, state: &AppState) -> Option<Str
     })
 }
 
-async fn viewer_session_from_header(headers: &HeaderMap, state: &AppState) -> Option<(String, String)> {
+async fn viewer_session_from_header(headers: &HeaderMap, state: &AppState) -> Option<(String, String, Option<i64>)> {
     let Some(token) = token_from_headers(headers, VIEWER_COOKIE) else { return None };
 
     let mut tokens = state.viewer_tokens.write().await;
     let now = Instant::now();
     tokens.retain(|_, session| session.expires_at > now);
-    tokens.get(&token).map(|session| (token.clone(), session.username.clone()))
+    if let Some(session) = tokens.get_mut(&token) {
+        if session.user_id.is_none() && !session.is_host {
+            let user_id = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM viewer_users WHERE LOWER(username) = LOWER(?) LIMIT 1"
+            )
+            .bind(&session.username)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+            session.user_id = user_id;
+        }
+        return Some((token.clone(), session.username.clone(), session.user_id));
+    }
+    None
 }
 
 async fn issue_viewer_token(
     state: &AppState,
     username: String,
     is_host: bool,
+    user_id: Option<i64>,
     ttl_override: Option<Duration>,
 ) -> String {
     let token = generate_key();
@@ -3609,6 +3737,7 @@ async fn issue_viewer_token(
             username,
             expires_at: Instant::now() + ttl,
             is_host,
+            user_id,
         },
     );
     token
@@ -3621,9 +3750,9 @@ async fn get_admin_accounts(pool: &MySqlPool) -> Vec<AdminAccount> {
 
 
 async fn get_viewer_accounts(pool: &MySqlPool) -> Vec<ViewerAccount> {
-    let rows = sqlx::query_as::<_, (String, String, String, String)>(
+    let rows = sqlx::query_as::<_, (i64, String, String, String, String)>(
         r#"
-        SELECT username, email, password_hash,
+        SELECT id, username, email, password_hash,
                DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at
         FROM viewer_users
         ORDER BY id ASC
@@ -3634,7 +3763,8 @@ async fn get_viewer_accounts(pool: &MySqlPool) -> Vec<ViewerAccount> {
     .unwrap_or_default();
     rows
         .into_iter()
-        .map(|(username, email, password_hash, created_at)| ViewerAccount {
+        .map(|(id, username, email, password_hash, created_at)| ViewerAccount {
+            id: Some(id),
             username,
             email,
             password_hash,
@@ -3645,18 +3775,19 @@ async fn get_viewer_accounts(pool: &MySqlPool) -> Vec<ViewerAccount> {
 
 async fn save_viewer_accounts(pool: &MySqlPool, accounts: &Vec<ViewerAccount>) {
     let mut tx = pool.begin().await.expect("viewer_users save tx");
-    sqlx::query("DELETE FROM viewer_users").execute(&mut *tx).await.expect("viewer_users delete");
     for acc in accounts {
-        sqlx::query(
-            "INSERT INTO viewer_users (username, email, password_hash, created_at) VALUES (?, ?, ?, ?)"
-        )
-        .bind(&acc.username)
-        .bind(&acc.email)
-        .bind(&acc.password_hash)
-        .bind(&acc.created_at)
-        .execute(&mut *tx)
-        .await
-        .expect("viewer_users insert");
+        if let Some(id) = acc.id {
+            let _ = sqlx::query(
+                "UPDATE viewer_users SET username = ?, email = ?, password_hash = ?, created_at = ? WHERE id = ?"
+            )
+            .bind(&acc.username)
+            .bind(&acc.email)
+            .bind(&acc.password_hash)
+            .bind(&acc.created_at)
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+        }
     }
     tx.commit().await.expect("viewer_users save commit");
 }
@@ -3693,7 +3824,7 @@ async fn cleanup_duplicate_viewers(state: &AppState) {
     }
     let reserved = reserved_usernames(state).await;
     let mut used: HashSet<String> = accounts.iter().map(|acc| normalize_username(&acc.username)).collect();
-    let mut renamed: Vec<(String, String, String)> = Vec::new();
+    let mut renamed: Vec<(i64, String, String, String)> = Vec::new();
 
     let mut grouped: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, acc) in accounts.iter().enumerate() {
@@ -3717,7 +3848,8 @@ async fn cleanup_duplicate_viewers(state: &AppState) {
                 }
                 used.insert(normalize_username(&next));
                 accounts[idx].username = next.clone();
-                renamed.push((old_name, next, accounts[idx].email.clone()));
+                let id = accounts[idx].id.unwrap_or(0);
+                renamed.push((id, old_name, next, accounts[idx].email.clone()));
             }
             keep_first = false;
         }
@@ -3730,7 +3862,7 @@ async fn cleanup_duplicate_viewers(state: &AppState) {
     save_viewer_accounts(&state.pool, &accounts).await;
 
     let mut tokens = state.viewer_tokens.write().await;
-    for (old_name, new_name, _) in renamed.iter() {
+    for (_id, old_name, new_name, _) in renamed.iter() {
         for session in tokens.values_mut() {
             if session.username.eq_ignore_ascii_case(old_name) {
                 session.username = new_name.clone();
@@ -3742,7 +3874,14 @@ async fn cleanup_duplicate_viewers(state: &AppState) {
     let smtp = state.smtp.read().await.clone();
     if let Some(smtp_cfg) = smtp {
         let templates = get_json(&state.pool, "notify_templates", default_notify_templates()).await;
-        for (old_name, new_name, email) in renamed {
+        for (id, old_name, new_name, email) in renamed {
+            if id > 0 {
+                let _ = sqlx::query("UPDATE viewer_users SET username = ? WHERE id = ?")
+                    .bind(&new_name)
+                    .bind(id)
+                    .execute(&state.pool)
+                    .await;
+            }
             let mut ctx = HashMap::new();
             ctx.insert("oldName".to_string(), old_name.clone());
             ctx.insert("newName".to_string(), new_name.clone());
@@ -4350,7 +4489,7 @@ async fn viewer_subscription_get(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let session = viewer_session_from_header(&headers, &state).await;
-    let Some((_token, username)) = session else {
+    let Some((_token, username, _)) = session else {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
     };
     let map = get_json(&state.pool, "viewer_subscriptions", json!({})).await;
@@ -4371,7 +4510,7 @@ async fn viewer_subscription_set(
     Json(payload): Json<ViewerSubscriptionPayload>,
 ) -> impl IntoResponse {
     let session = viewer_session_from_header(&headers, &state).await;
-    let Some((_token, username)) = session else {
+    let Some((_token, username, _)) = session else {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
     };
     let mut map = get_json(&state.pool, "viewer_subscriptions", json!({})).await;

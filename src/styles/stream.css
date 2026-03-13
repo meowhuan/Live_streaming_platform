@@ -313,6 +313,26 @@
   color: rgba(200, 188, 226, 0.78);
 }
 
+.replay-toast {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 12px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(233, 217, 234, 0.9);
+  box-shadow: 0 10px 24px rgba(47, 20, 47, 0.16);
+  z-index: 7;
+}
+
+.app-night .replay-toast {
+  background: rgba(24, 18, 40, 0.92);
+  border-color: rgba(72, 66, 108, 0.7);
+  color: #f0e8ff;
+}
+
 .chat-level {
   font-size: 10px;
   padding: 1px 6px;
