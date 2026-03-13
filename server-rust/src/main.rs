@@ -10,7 +10,7 @@ use axum::{
         ws::{Message as WsMessage, WebSocket},
         State, WebSocketUpgrade,
     },
-    http::{HeaderMap, HeaderName, StatusCode, HeaderValue},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -34,7 +34,6 @@ use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio::process::Command;
 use tokio::fs;
-use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use chrono::TimeZone;
 use tracing::info;
@@ -382,8 +381,6 @@ async fn main() {
     let viewer_token_ttl = Duration::from_secs(env_u64("VIEWER_TOKEN_DAYS", 30) * 24 * 3600);
     let viewer_anti_abuse_defaults = ViewerAntiAbuseConfig::from_env();
     let live_count_fallback_secs = env_u64("LIVE_COUNT_FALLBACK_SECS", 3600);
-    let cors_origins = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
-    let cors = build_cors(&cors_origins);
 
     let pool = create_pool().await;
     ensure_tables(&pool).await;
@@ -525,8 +522,7 @@ async fn main() {
         .route("/api/admin/room/create", post(admin_room_create))
         .route("/api/admin/ingest/refresh", post(admin_ingest_refresh))
         .route("/api/ingest/report", post(report_ingest))
-        .route(&ws_path, get(ws_handler))
-        .layer(cors);
+        .route(&ws_path, get(ws_handler));
 
     cleanup_duplicate_viewers(&state).await;
 
