@@ -35,7 +35,7 @@ use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio::process::Command;
 use tokio::fs;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use chrono::TimeZone;
 use tracing::info;
@@ -1061,7 +1061,11 @@ fn build_cors(origins_raw: &str) -> CorsLayer {
     }
     CorsLayer::new()
         .allow_origin(origins)
-        .allow_methods(Any)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::OPTIONS,
+        ])
         .allow_headers([
             HeaderName::from_static("content-type"),
             HeaderName::from_static("authorization"),
