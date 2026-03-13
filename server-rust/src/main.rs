@@ -10,7 +10,7 @@ use axum::{
         ws::{Message as WsMessage, WebSocket},
         State, WebSocketUpgrade,
     },
-    http::{HeaderMap, StatusCode, HeaderValue},
+    http::{HeaderMap, HeaderName, StatusCode, HeaderValue},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -1062,7 +1062,12 @@ fn build_cors(origins_raw: &str) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(origins)
         .allow_methods(Any)
-        .allow_headers(Any)
+        .allow_headers([
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("x-requested-with"),
+            HeaderName::from_static("cf-access-jwt-assertion"),
+        ])
         .allow_credentials(true)
 }
 
