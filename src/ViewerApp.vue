@@ -78,7 +78,7 @@ const chatRateLocal = computed(() => {
   return `${count} / min`;
 });
 
-const playInfo = ref({ whep: "", llHls: "", hls: "", modes: [] });
+const playInfo = ref({ whep: "", hls: "", modes: [] });
 const playerError = ref("");
 const streamUnavailable = computed(() => {
   const message = playerError.value || "";
@@ -256,7 +256,6 @@ const reportWhepStats = async () => {
 const modeLabels = {
   auto: "智能",
   whep: "超低延迟",
-  "ll-hls": "低延迟",
   hls: "稳定"
 };
 
@@ -265,8 +264,7 @@ const availableModes = computed(() => {
   if (!modes.length) {
     const fallback = [];
     if (playInfo.value.whep) fallback.push("whep");
-    if (playInfo.value.llHls) fallback.push("ll-hls");
-    if (playInfo.value.hls) fallback.push("hls");
+  if (playInfo.value.hls) fallback.push("hls");
     return fallback;
   }
   return modes;
@@ -335,20 +333,25 @@ const fetchJson = async (url) => {
 const loadAll = async () => {
   loading.value = true;
   error.value = "";
-  try {
-    const [streamRes, scheduleRes, opsRes, chatRes, notifyRes] = await Promise.all([
-      fetchJson("/api/stream"),
-      fetchJson("/api/schedule"),
-      fetchJson("/api/ops/alerts"),
-      fetchJson("/api/chat/latest"),
-      fetchJson("/api/notifications")
-    ]);
-    stream.value = streamRes;
-    scheduleList.value = scheduleRes.items || [];
-    opsAlerts.value = opsRes.items || [];
-    chatMessages.value = (chatRes.items || []).map(normalizeChatMessage);
-    notifications.value = notifyRes.items || [];
-    playerError.value = "";
+    try {
+      const coreResults = await Promise.allSettled([
+        fetchJson("/api/stream"),
+        fetchJson("/api/schedule"),
+        fetchJson("/api/ops/alerts"),
+        fetchJson("/api/chat/latest"),
+        fetchJson("/api/notifications")
+      ]);
+      const [streamRes, scheduleRes, opsRes, chatRes, notifyRes] = coreResults.map((r) =>
+        r.status === "fulfilled" ? r.value : null
+      );
+      if (streamRes) {
+        stream.value = streamRes;
+      }
+      scheduleList.value = scheduleRes?.items || [];
+      opsAlerts.value = opsRes?.items || [];
+      chatMessages.value = (chatRes?.items || []).map(normalizeChatMessage);
+      notifications.value = notifyRes?.items || [];
+      if (streamRes) playerError.value = "";
     const extraResults = await Promise.allSettled([
       fetchJson("/api/stream/play"),
       fetchJson("/api/stream/replay"),
@@ -361,7 +364,6 @@ const loadAll = async () => {
     );
     const normalized = {
       whep: normalizePlayUrl(playRes?.whep || ""),
-      llHls: normalizePlayUrl(playRes?.llHls || ""),
       hls: normalizePlayUrl(playRes?.hls || ""),
       modes: playRes?.modes || []
     };
@@ -936,19 +938,36 @@ const stopPlayback = () => {
   }
 };
 
-const startHls = async (rawUrl, mode) => {
-  const url = normalizePlayUrl(rawUrl || "");
-  if (!url) {
-    playerStatus.value = "idle";
-    playerError.value = "未开播";
-    return false;
-  }
-  stopPlayback();
-  playerError.value = "";
-  playerStatus.value = "connecting";
-  if (videoRef.value) {
-    videoRef.value.srcObject = null;
-    videoRef.value.src = url;
+  const startHls = async (rawUrl, mode) => {
+    const url = normalizePlayUrl(rawUrl || "");
+    if (!url) {
+      playerStatus.value = "idle";
+      playerError.value = "";
+      return false;
+    }
+    stopPlayback();
+    playerError.value = "";
+    playerStatus.value = "connecting";
+    try {
+      const probe = await fetch(url, { method: "GET", cache: "no-store" });
+      if (probe.status === 404) {
+        if (/index\.m3u8(\?|$)/i.test(url)) {
+          playerStatus.value = "idle";
+          playerError.value = "未开播";
+          return false;
+        }
+      }
+      if (probe.status === 401 || probe.status === 403) {
+        playerStatus.value = "error";
+        playerError.value = "播放地址需要授权";
+        return false;
+      }
+    } catch {
+      // ignore probe errors; let player try to play
+    }
+    if (videoRef.value) {
+      videoRef.value.srcObject = null;
+      videoRef.value.src = url;
     try {
       await videoRef.value.play();
     } catch {
@@ -973,21 +992,16 @@ const requestUnmute = async () => {
   }
 };
 
-const startPlaybackFromMode = async () => {
-  if (!playInfo.value?.whep && !playInfo.value?.hls && !playInfo.value?.llHls) {
-    playerError.value = "未开播";
-    playerStatus.value = "idle";
-    return;
-  }
+  const startPlaybackFromMode = async () => {
+    if (!playInfo.value?.whep && !playInfo.value?.hls) {
+      playerStatus.value = "idle";
+      return;
+    }
   const mode = selectedMode.value;
   if (mode === "auto") {
     if (playInfo.value.whep && supportsWhep()) {
       const ok = await startWhep(playInfo.value.whep);
       if (ok) return;
-    }
-    if (playInfo.value.llHls) {
-      await startHls(playInfo.value.llHls, "ll-hls");
-      return;
     }
     if (playInfo.value.hls) {
       await startHls(playInfo.value.hls, "hls");
@@ -1003,12 +1017,8 @@ const startPlaybackFromMode = async () => {
     await startWhep(playInfo.value.whep);
     return;
   }
-  if (mode === "ll-hls") {
-    await startHls(playInfo.value.llHls || playInfo.value.hls, "ll-hls");
-    return;
-  }
-  await startHls(playInfo.value.hls, "hls");
-};
+    await startHls(playInfo.value.hls, "hls");
+  };
 
 const resolveSeekableEnd = (video) => {
   if (!video) return null;
@@ -1021,15 +1031,15 @@ const resolveSeekableEnd = (video) => {
 
 const canReplay = computed(() => {
   if (!replayInfo.value.enabled) return false;
-  return !!(replayInfo.value.hls || playInfo.value.llHls || playInfo.value.hls);
+  return !!(replayInfo.value.hls || playInfo.value.hls);
 });
 
 const ensureHlsForReplay = async () => {
-  if (activeMode.value === "hls" || activeMode.value === "ll-hls") return true;
+  if (activeMode.value === "hls") return true;
   replayWasWhep.value = activeMode.value === "whep";
-  const hlsUrl = replayInfo.value.hls || playInfo.value.llHls || playInfo.value.hls;
+  const hlsUrl = replayInfo.value.hls || playInfo.value.hls;
   if (!hlsUrl) return false;
-  await startHls(hlsUrl, playInfo.value.llHls ? "ll-hls" : "hls");
+  await startHls(hlsUrl, "hls");
   if (replayWasWhep.value) {
     replayNotice.value = "已进入回放模式（已切换为 HLS）";
     setTimeout(() => {
@@ -1064,11 +1074,11 @@ const jumpLive = async () => {
   }
 };
 
-const startWhep = async (url) => {
-  if (!url) return;
-  playerError.value = "";
-  playerStatus.value = "connecting";
-  stopPlayback();
+  const startWhep = async (url) => {
+    if (!url) return;
+    playerError.value = "";
+    playerStatus.value = "connecting";
+    stopPlayback();
 
   pc = new RTCPeerConnection();
   pc.addTransceiver("video", { direction: "recvonly" });
@@ -1089,29 +1099,29 @@ const startWhep = async (url) => {
   await waitIceGathering(pc);
 
   let res = null;
-  try {
-    res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/sdp", Accept: "application/sdp" },
-      body: pc.localDescription.sdp
-    });
-  } catch {
-    playerStatus.value = "idle";
-      playerError.value = "未开播";
-    return false;
-  }
-
-  if (!res.ok) {
-    const text = await res.text();
-    if (res.status === 404 && text.includes("no stream is available")) {
-      playerStatus.value = "idle";
-      playerError.value = "未开播";
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp", Accept: "application/sdp" },
+        body: pc.localDescription.sdp
+      });
+    } catch {
+      playerStatus.value = "error";
+      playerError.value = "WHEP 连接失败";
       return false;
     }
-    playerStatus.value = "error";
-    playerError.value = `WHEP 连接失败 ${res.status}: ${text || "Bad Request"}`;
-    return false;
-  }
+
+    if (!res.ok) {
+      const text = await res.text();
+      if (res.status === 404) {
+        playerStatus.value = "idle";
+        playerError.value = "未开播";
+        return false;
+      }
+      playerStatus.value = "error";
+      playerError.value = `WHEP 连接失败 ${res.status}: ${text || "Bad Request"}`;
+      return false;
+    }
 
   const answerSdp = await res.text();
   if (!answerSdp) {

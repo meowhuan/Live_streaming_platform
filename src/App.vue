@@ -41,6 +41,8 @@ const actionNotice = ref("");
 const adminSessionOk = ref(false);
 const isAuthed = computed(() => !!adminToken.value || adminSessionOk.value);
 const cfAccessEnabled = ref(false);
+const accessVerified = ref(false);
+const accessChecking = ref(false);
 const smtpConfig = ref({
   host: "",
   port: 587,
@@ -760,61 +762,24 @@ const saveTelegram = async () => {
   }
 };
 
-const loginAdminAccess = async () => {
-  if (!adminTurnstileToken.value) {
-    actionNotice.value = "请完成人机验证";
+const verifyAccess = async () => {
+  if (!cfAccessEnabled.value) {
+    accessVerified.value = true;
     return;
   }
-  adminSaving.value = true;
-  actionNotice.value = "";
+  accessChecking.value = true;
   try {
     const res = await fetch(apiUrl("/api/admin/turnstile-login"), {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        turnstileToken: adminTurnstileToken.value,
-        rememberDays: adminRememberDays.value || undefined
-      })
+      body: JSON.stringify({})
     });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(text || "登录失败");
-    }
-    const data = await res.json();
-    adminToken.value = data.token;
-    localStorage.setItem("live_admin_token", data.token);
-    if (data.expiresIn) {
-      localStorage.setItem("live_admin_token_expires_at", String(Date.now() + Number(data.expiresIn) * 1000));
-    }
-    adminIdentity.value = "Cloudflare Access";
-    localStorage.setItem("live_admin_identity", adminIdentity.value);
-    if (data.viewerToken) {
-      localStorage.setItem("viewer_token", data.viewerToken);
-      localStorage.setItem("viewer_identity", data.viewerName || "主播");
-      adminViewerToken.value = data.viewerToken;
-      if (data.expiresIn) {
-        localStorage.setItem("viewer_token_expires_at", String(Date.now() + Number(data.expiresIn) * 1000));
-      }
-    }
-    if (adminRememberDays.value) {
-      localStorage.setItem("live_admin_remember_days", String(adminRememberDays.value));
-    } else {
-      localStorage.removeItem("live_admin_remember_days");
-    }
-    adminSessionOk.value = true;
-    actionNotice.value = "已登录";
-    enterAdmin();
-    adminTurnstileToken.value = "";
-    if (window.turnstile) window.turnstile.reset();
-  } catch (err) {
-    actionNotice.value = err instanceof Error ? err.message : "登录失败";
+    accessVerified.value = res.ok;
+  } catch {
+    accessVerified.value = false;
   } finally {
-    if (window.turnstile) window.turnstile.reset();
-    adminSaving.value = false;
-    setTimeout(() => {
-      actionNotice.value = "";
-    }, 2000);
+    accessChecking.value = false;
   }
 };
 
@@ -1089,21 +1054,16 @@ const connectWs = () => {
   watch(() => !isAuthed.value, (show) => {
     if (show) renderAdminTurnstile();
   }, { immediate: true });
-  watch(cfAccessEnabled, () => {
-    if (!isAuthed.value) renderAdminTurnstile();
-  });
-  watch([adminTurnstileToken, cfAccessEnabled, isAuthed], () => {
-    if (!cfAccessEnabled.value) return;
-    if (isAuthed.value) return;
-    if (!adminTurnstileToken.value) return;
-    if (adminSaving.value) return;
-    loginAdminAccess();
-  });
+    watch(cfAccessEnabled, () => {
+      if (!isAuthed.value) renderAdminTurnstile();
+      verifyAccess();
+    });
+    verifyAccess();
     if (adminToken.value) {
       enterAdmin();
     } else {
-    loadAdminSession().finally(() => {
-      if (!isAuthed.value) loading.value = false;
+      loadAdminSession().finally(() => {
+        if (!isAuthed.value) loading.value = false;
     });
   }
 });
@@ -1232,29 +1192,12 @@ onBeforeUnmount(() => {
               </div>
             </div>
 
-            <div v-if="cfAccessEnabled" class="mt-6 grid gap-4">
-              <div class="field-group">
-                <label class="field-label">人机验证</label>
-                <div ref="adminTurnstileRef"></div>
+            <div class="mt-6 grid gap-4">
+              <div v-if="cfAccessEnabled" class="text-xs text-[#8f6aa2]">
+                <span v-if="accessChecking">Access 校验中...</span>
+                <span v-else-if="accessVerified">Access 已通过，可登录</span>
+                <span v-else>Access 未通过，请先完成 Cloudflare Access 登录</span>
               </div>
-              <div class="field-group">
-                <label class="field-label">保持登录</label>
-                <div class="flex flex-wrap items-center gap-3 text-xs">
-                  <select v-model="adminRememberDays" class="field-input !h-8 !text-xs w-[140px]">
-                    <option :value="0">默认时长</option>
-                    <option :value="7">保持 7 天</option>
-                    <option :value="30">保持 30 天</option>
-                  </select>
-                </div>
-              </div>
-              <div class="flex flex-wrap gap-2">
-                <button class="meow-btn-primary motion-press" type="button" :disabled="adminSaving || !adminTurnstileToken" @click="loginAdminAccess">
-                  进入管理端
-                </button>
-              </div>
-              <div v-if="actionNotice" class="text-xs text-[#e06b8b]">{{ actionNotice }}</div>
-            </div>
-            <div v-else class="mt-6 grid gap-4">
               <div class="field-group">
                 <label class="field-label">管理员账号 / 邮箱</label>
                 <input v-model="adminUser" class="field-input" placeholder="admin 或 meow@example.com" />
@@ -1286,7 +1229,7 @@ onBeforeUnmount(() => {
                 <div ref="adminTurnstileRef"></div>
               </div>
               <div class="flex flex-wrap gap-2">
-                <button class="meow-btn-primary motion-press" type="button" :disabled="adminSaving || !adminTurnstileToken" @click="loginAdmin">
+                <button class="meow-btn-primary motion-press" type="button" :disabled="adminSaving || !adminTurnstileToken || (cfAccessEnabled && !accessVerified)" @click="loginAdmin">
                   登录
                 </button>
               </div>

@@ -81,7 +81,6 @@ struct AppState {
     clip_dir: String,
     clip_ttl: Duration,
     ffmpeg_bin: String,
-    mediamtx_ll_hls: Option<String>,
     thumbnail_interval: Duration,
     thumbnail_source: Option<String>,
 }
@@ -131,13 +130,6 @@ struct RegisterTokenPayload {
     turnstile_token: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct AdminTurnstilePayload {
-    #[serde(rename = "turnstileToken")]
-    turnstile_token: Option<String>,
-    #[serde(rename = "rememberDays")]
-    remember_days: Option<u64>,
-}
 
 #[derive(Deserialize)]
 struct RegisterVerifyPayload {
@@ -390,7 +382,6 @@ async fn main() {
     let mediamtx_path = std::env::var("MEDIAMTX_PATH").unwrap_or_else(|_| "live/stream".to_string());
     let mediamtx_webrtc = std::env::var("MEDIAMTX_WEBRTC").unwrap_or_else(|_| "http://127.0.0.1:8889".to_string());
     let mediamtx_hls = std::env::var("MEDIAMTX_HLS").unwrap_or_else(|_| "http://127.0.0.1:8888".to_string());
-    let mediamtx_ll_hls = std::env::var("MEDIAMTX_LL_HLS").ok().filter(|v| !v.trim().is_empty());
     let mediamtx_poll = env_u64("MEDIAMTX_POLL_MS", 2000);
     let hls_segment_duration_secs = env_u64("HLS_SEGMENT_DURATION_SECS", 2);
     let hls_segment_count = env_u64("HLS_SEGMENT_COUNT", 60);
@@ -481,7 +472,6 @@ async fn main() {
         clip_dir,
         clip_ttl,
         ffmpeg_bin,
-        mediamtx_ll_hls,
         thumbnail_interval,
         thumbnail_source,
     };
@@ -1332,10 +1322,6 @@ async fn get_stream_play(
     let read = ensure_read_token(&state).await;
     let webrtc_base = public_media_base(&state.mediamtx_webrtc, &headers);
     let hls_base = public_media_base(&state.mediamtx_hls, &headers);
-    let ll_hls = state
-        .mediamtx_ll_hls
-        .as_ref()
-        .map(|base| resolve_media_base(base, &hls_base, &headers));
     let whep = format!(
         "{}/{}/whep?token={}",
         webrtc_base.trim_end_matches('/'),
@@ -1348,23 +1334,10 @@ async fn get_stream_play(
         state.mediamtx_path,
         read
     );
-    let ll_hls_url = ll_hls.map(|base| {
-        let trimmed = base.trim_end_matches('/');
-        let path_marker = format!("/{}/", state.mediamtx_path);
-        if trimmed.contains(&path_marker) || trimmed.ends_with(&format!("/{}", state.mediamtx_path)) {
-            format!("{}/index.m3u8?token={}", trimmed, read)
-        } else {
-            format!("{}/{}/index.m3u8?token={}", trimmed, state.mediamtx_path, read)
-        }
-    });
     let mut modes = vec!["whep"];
-    if ll_hls_url.is_some() {
-        modes.push("ll-hls");
-    }
     modes.push("hls");
     Json(json!({
         "whep": whep,
-        "llHls": ll_hls_url,
         "hls": hls,
         "token": read,
         "modes": modes
@@ -2671,7 +2644,6 @@ async fn admin_logout() -> impl IntoResponse {
 async fn admin_turnstile_login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(payload): Json<AdminTurnstilePayload>,
 ) -> impl IntoResponse {
     if !cf_access_enabled(&state) {
         return (StatusCode::BAD_REQUEST, HeaderMap::new(), Json(json!({ "error": "access_not_enabled" })));
@@ -2679,29 +2651,7 @@ async fn admin_turnstile_login(
     if !verify_cf_access(&headers, &state).await {
         return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "access" })));
     }
-    if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "turnstile" })));
-    }
-
-    let ttl = ttl_from_remember(state.token_ttl, payload.remember_days);
-    let token = generate_key();
-    let mut tokens = state.tokens.write().await;
-    tokens.insert(token.clone(), Instant::now() + ttl);
-
-    let viewer_token = issue_viewer_token(&state, "主播".to_string(), true, None, Some(ttl)).await;
-    let mut headers_out = HeaderMap::new();
-    append_cookie(&mut headers_out, build_cookie(ADMIN_COOKIE, &token, ttl.as_secs()));
-    append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &viewer_token, ttl.as_secs()));
-    (
-        StatusCode::OK,
-        headers_out,
-        Json(json!({
-            "token": token,
-            "expiresIn": ttl.as_secs(),
-            "viewerToken": viewer_token,
-            "viewerName": "主播"
-        }))
-    )
+    (StatusCode::OK, HeaderMap::new(), Json(json!({ "ok": true })))
 }
 
 async fn admin_smtp_get(
