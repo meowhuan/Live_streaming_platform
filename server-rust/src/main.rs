@@ -976,6 +976,30 @@ fn parse_schedule_start(item: &Value) -> Option<i64> {
             return Some(chrono::Utc.from_utc_datetime(&dt).timestamp());
         }
     }
+    let time_raw = item
+        .get("time")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty());
+    if let Some(time_str) = time_raw {
+        let time = chrono::NaiveTime::parse_from_str(time_str, "%H:%M:%S")
+            .or_else(|_| chrono::NaiveTime::parse_from_str(time_str, "%H:%M"))
+            .ok()?;
+        let now_local = chrono::Local::now();
+        let mut date = now_local.date_naive();
+        if let Some(date_str) = item.get("date").and_then(|v| v.as_str()) {
+            if let Ok(parsed) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                date = parsed;
+            }
+        }
+        let mut naive = chrono::NaiveDateTime::new(date, time);
+        if item.get("date").is_none() && naive <= now_local.naive_local() {
+            naive += chrono::Duration::days(1);
+        }
+        if let Some(local_dt) = chrono::Local.from_local_datetime(&naive).single() {
+            return Some(local_dt.timestamp());
+        }
+    }
     None
 }
 
@@ -1004,31 +1028,6 @@ fn default_notify_templates() -> Value {
         "live_url": "",
         "rules": []
     })
-}
-
-fn build_cors(origins_raw: &str) -> CorsLayer {
-    let origins = origins_raw
-        .split(',')
-        .map(|val| val.trim())
-        .filter(|val| !val.is_empty())
-        .filter_map(|val| val.parse::<HeaderValue>().ok())
-        .collect::<Vec<_>>();
-    if origins.is_empty() {
-        return CorsLayer::permissive();
-    }
-    CorsLayer::new()
-        .allow_origin(origins)
-        .allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::OPTIONS,
-        ])
-        .allow_headers([
-            HeaderName::from_static("content-type"),
-            HeaderName::from_static("authorization"),
-            HeaderName::from_static("x-requested-with"),
-        ])
-        .allow_credentials(true)
 }
 
 fn env_u16(key: &str, fallback: u16) -> u16 {
