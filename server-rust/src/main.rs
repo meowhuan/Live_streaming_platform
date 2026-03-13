@@ -2522,9 +2522,6 @@ async fn admin_login(
     headers: HeaderMap,
     Json(payload): Json<LoginPayload>,
 ) -> impl IntoResponse {
-    if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "turnstile" })));
-    }
     if !check_cf_access(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "access" })));
     }
