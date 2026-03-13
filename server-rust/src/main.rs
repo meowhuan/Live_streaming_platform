@@ -265,7 +265,6 @@ struct AuthRequest {
 
 #[allow(dead_code)]
 #[derive(Deserialize)]
-#[derive(Deserialize)]
 struct ChatSend {
     text: String,
 }
