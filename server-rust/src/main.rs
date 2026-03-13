@@ -10,7 +10,7 @@ use axum::{
         ws::{Message as WsMessage, WebSocket},
         State, WebSocketUpgrade,
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, HeaderValue},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -35,7 +35,7 @@ use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio::process::Command;
 use tokio::fs;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use chrono::TimeZone;
 use tracing::info;
@@ -426,6 +426,8 @@ async fn main() {
     let viewer_token_ttl = Duration::from_secs(env_u64("VIEWER_TOKEN_DAYS", 30) * 24 * 3600);
     let viewer_anti_abuse_defaults = ViewerAntiAbuseConfig::from_env();
     let live_count_fallback_secs = env_u64("LIVE_COUNT_FALLBACK_SECS", 3600);
+    let cors_origins = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
+    let cors = build_cors(&cors_origins);
 
     let pool = create_pool().await;
     ensure_tables(&pool).await;
@@ -571,7 +573,7 @@ async fn main() {
         .route("/api/admin/ingest/refresh", post(admin_ingest_refresh))
         .route("/api/ingest/report", post(report_ingest))
         .route(&ws_path, get(ws_handler))
-        .layer(CorsLayer::permissive());
+        .layer(cors);
 
     cleanup_duplicate_viewers(&state).await;
 
@@ -1045,6 +1047,23 @@ fn default_notify_templates() -> Value {
         "live_url": "",
         "rules": []
     })
+}
+
+fn build_cors(origins_raw: &str) -> CorsLayer {
+    let origins = origins_raw
+        .split(',')
+        .map(|val| val.trim())
+        .filter(|val| !val.is_empty())
+        .filter_map(|val| val.parse::<HeaderValue>().ok())
+        .collect::<Vec<_>>();
+    if origins.is_empty() {
+        return CorsLayer::permissive();
+    }
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .allow_credentials(true)
 }
 
 fn env_u16(key: &str, fallback: u16) -> u16 {
@@ -4333,13 +4352,19 @@ fn token_from_headers(headers: &HeaderMap, cookie_name: &str) -> Option<String> 
 }
 
 fn build_cookie(name: &str, value: &str, max_age_secs: u64) -> String {
+    let same_site = std::env::var("COOKIE_SAMESITE").unwrap_or_else(|_| "Lax".to_string());
+    let secure = env_bool("COOKIE_SECURE", true);
+    let secure_attr = if secure { "; Secure" } else { "" };
     format!(
-        "{name}={value}; Path=/; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax"
+        "{name}={value}; Path=/; Max-Age={max_age_secs}; HttpOnly; SameSite={same_site}{secure_attr}"
     )
 }
 
 fn clear_cookie(name: &str) -> String {
-    format!("{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+    let same_site = std::env::var("COOKIE_SAMESITE").unwrap_or_else(|_| "Lax".to_string());
+    let secure = env_bool("COOKIE_SECURE", true);
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{name}=; Path=/; Max-Age=0; HttpOnly; SameSite={same_site}{secure_attr}")
 }
 
 fn append_cookie(headers: &mut HeaderMap, cookie: String) {
