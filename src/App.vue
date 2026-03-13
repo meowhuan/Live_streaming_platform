@@ -466,6 +466,7 @@ const adminFetch = async (url, payload) => {
     const hasBody = payload !== undefined && payload !== null;
     const res = await fetch(apiUrl(url), {
       method: "POST",
+      credentials: "include",
       headers: {
         ...(hasBody ? { "Content-Type": "application/json" } : {}),
         ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
@@ -509,6 +510,7 @@ const loginAdmin = async () => {
   try {
     const res = await fetch(apiUrl("/api/admin/login"), {
       method: "POST",
+      credentials: "include",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         username: adminUser.value,
@@ -571,7 +573,7 @@ const loginAdmin = async () => {
 
 const logoutAdmin = async () => {
   try {
-    await fetch(apiUrl("/api/admin/logout"), { method: "POST" });
+      await fetch(apiUrl("/api/admin/logout"), { method: "POST", credentials: "include" });
   } catch {
     // ignore
   }
@@ -581,6 +583,7 @@ const logoutAdmin = async () => {
 const loadSmtp = async () => {
   try {
     const res = await fetch(apiUrl("/api/admin/smtp"), {
+      credentials: "include",
       headers: {
         ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
       }
@@ -611,6 +614,7 @@ const loadSmtp = async () => {
 const loadAdminSession = async () => {
   try {
     const res = await fetch(apiUrl("/api/admin/me"), {
+      credentials: "include",
       headers: {
         ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
       }
@@ -627,6 +631,7 @@ const loadAdminSession = async () => {
 const loadTelegram = async () => {
   try {
     const res = await fetch(apiUrl("/api/admin/telegram/channel"), {
+      credentials: "include",
       headers: {
         ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
       }
@@ -649,6 +654,7 @@ const loadTelegram = async () => {
 const loadNotifyTemplates = async () => {
   try {
     const res = await fetch(apiUrl("/api/admin/notify-templates"), {
+      credentials: "include",
       headers: {
         ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
       }
@@ -692,6 +698,7 @@ const saveNotifyTemplates = async () => {
     };
     const res = await fetch(apiUrl("/api/admin/notify-templates"), {
       method: "POST",
+      credentials: "include",
       headers: {
         "Content-Type": "application/json",
         ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
@@ -724,6 +731,7 @@ const saveTelegram = async () => {
   try {
     const res = await fetch(apiUrl("/api/admin/telegram/channel"), {
       method: "POST",
+      credentials: "include",
       headers: {
         "Content-Type": "application/json",
         ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
@@ -762,6 +770,7 @@ const loginAdminAccess = async () => {
   try {
     const res = await fetch(apiUrl("/api/admin/turnstile-login"), {
       method: "POST",
+      credentials: "include",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         turnstileToken: adminTurnstileToken.value,
@@ -812,6 +821,7 @@ const loginAdminAccess = async () => {
 const loadViewerAntiAbuse = async () => {
   try {
     const res = await fetch(apiUrl("/api/admin/viewer-anti-abuse"), {
+      credentials: "include",
       headers: {
         ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
       }
@@ -851,6 +861,7 @@ const saveViewerAntiAbuse = async () => {
     };
     const res = await fetch(apiUrl("/api/admin/viewer-anti-abuse"), {
       method: "POST",
+      credentials: "include",
       headers: {
         "Content-Type": "application/json",
         ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
@@ -891,6 +902,7 @@ const saveSmtp = async () => {
     };
     const res = await fetch(apiUrl("/api/admin/smtp"), {
       method: "POST",
+      credentials: "include",
       headers: {
         "Content-Type": "application/json",
         ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
@@ -928,6 +940,7 @@ const sendSmtpTest = async () => {
   try {
     const res = await fetch(apiUrl("/api/admin/smtp/test"), {
       method: "POST",
+      credentials: "include",
       headers: {
         "Content-Type": "application/json",
         ...(adminToken.value ? { authorization: `Bearer ${adminToken.value}` } : {})
@@ -1033,22 +1046,11 @@ const connectWs = () => {
   };
 };
 
-onMounted(() => {
-  if (!document.getElementById("turnstile-script")) {
-    const script = document.createElement("script");
-    script.id = "turnstile-script";
-    script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js";
-    script.async = true;
-    script.defer = true;
-    document.body.appendChild(script);
-  }
-  window.onAdminTurnstile = (token) => {
-    adminTurnstileToken.value = token;
-  };
-  const detectAccess = () =>
-    fetch("/cdn-cgi/access/get-identity")
-      .then((res) => res.ok)
-      .catch(() => false);
+  onMounted(() => {
+    const detectAccess = () =>
+      fetch("/cdn-cgi/access/get-identity")
+        .then((res) => res.ok)
+        .catch(() => false);
 
   const apiHostDiff = (() => {
     try {
@@ -1060,11 +1062,13 @@ onMounted(() => {
     }
   })();
 
-  Promise.all([
-    fetch(apiUrl("/api/admin/access-mode"))
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (data && typeof data.cf_access_enabled === "boolean") {
+    Promise.all([
+      fetch(apiUrl("/api/admin/access-mode"), {
+        credentials: "include"
+      })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (data && typeof data.cf_access_enabled === "boolean") {
           return data.cf_access_enabled;
         }
         return null;
@@ -1095,53 +1099,51 @@ onMounted(() => {
     if (adminSaving.value) return;
     loginAdminAccess();
   });
-  watch([adminTurnstileToken, cfAccessEnabled, isAuthed], () => {
-    if (!cfAccessEnabled.value) return;
-    if (isAuthed.value) return;
-    if (!adminTurnstileToken.value) return;
-    if (adminSaving.value) return;
-    loginAdminAccess();
-  });
-  if (adminToken.value) {
-    enterAdmin();
-  } else {
+    if (adminToken.value) {
+      enterAdmin();
+    } else {
     loadAdminSession().finally(() => {
       if (!isAuthed.value) loading.value = false;
     });
   }
 });
 
-const renderAdminTurnstile = async () => {
-  await nextTick();
-  if (!window.turnstile) {
-    if (!adminTurnstileScriptLoading) {
-      adminTurnstileScriptLoading = true;
-      const existing = document.getElementById("turnstile-script");
-      if (!existing) {
-        const script = document.createElement("script");
-        script.id = "turnstile-script";
-        script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js";
-        script.async = true;
-        script.defer = true;
-        script.onload = () => renderAdminTurnstile();
-        document.body.appendChild(script);
+  const renderAdminTurnstile = async () => {
+    await nextTick();
+    if (!window.turnstile) {
+      if (!adminTurnstileScriptLoading) {
+        adminTurnstileScriptLoading = true;
+        const existing = document.getElementById("turnstile-script");
+        if (!existing) {
+          const script = document.createElement("script");
+          script.id = "turnstile-script";
+          script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+          script.async = true;
+          script.defer = true;
+          script.onload = () => renderAdminTurnstile();
+          document.body.appendChild(script);
+          return;
+        }
+      }
+      return;
+    }
+    if (!window.turnstile || !adminTurnstileRef.value) return;
+    if (adminTurnstileId) {
+      if (adminTurnstileRef.value.childElementCount === 0) {
+        window.turnstile.remove(adminTurnstileId);
+        adminTurnstileId = null;
+      } else {
+        window.turnstile.reset(adminTurnstileId);
         return;
       }
     }
-    return;
-  }
-  if (!window.turnstile || !adminTurnstileRef.value) return;
-  if (adminTurnstileId) {
-    window.turnstile.reset(adminTurnstileId);
-    return;
-  }
-  adminTurnstileId = window.turnstile.render(adminTurnstileRef.value, {
-    sitekey: "0x4AAAAAACncUgjk6YpyY6aB",
-    callback: (token) => {
-      adminTurnstileToken.value = token;
-    }
-  });
-};
+    adminTurnstileId = window.turnstile.render(adminTurnstileRef.value, {
+      sitekey: "0x4AAAAAACncUgjk6YpyY6aB",
+      callback: (token) => {
+        adminTurnstileToken.value = token;
+      }
+    });
+  };
 
 const normalizeSchedule = (items) => {
   if (!Array.isArray(items)) return [];
