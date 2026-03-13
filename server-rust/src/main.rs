@@ -24,7 +24,6 @@ use srt_tokio::SrtSocket;
 use sqlx::{mysql::MySqlPoolOptions, MySqlPool};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message as MailMessage,
     message::header::ContentType,
@@ -65,9 +64,7 @@ struct AppState {
     metrics_state: RwLock<MetricsState>,
     turnstile_secret: Option<String>,
     viewer_anti_abuse_defaults: ViewerAntiAbuseConfig,
-    cf_access_team_domain: Option<String>,
-    cf_access_aud: Option<String>,
-    cf_access_jwks: RwLock<Option<CfAccessJwksCache>>,
+    cf_access_required: bool,
     telegram_bot_token: Option<String>,
     chat_filter_words: Vec<String>,
     public_base_url: String,
@@ -268,33 +265,6 @@ struct AuthRequest {
 
 #[allow(dead_code)]
 #[derive(Deserialize)]
-struct CfAccessClaims {
-    aud: Vec<String>,
-    exp: usize,
-    iat: usize,
-    sub: String,
-    email: Option<String>,
-}
-
-#[derive(Deserialize, Clone)]
-struct CfAccessJwks {
-    keys: Vec<CfAccessJwk>,
-}
-
-#[derive(Deserialize, Clone)]
-struct CfAccessJwk {
-    kid: String,
-    #[allow(dead_code)]
-    kty: Option<String>,
-    n: String,
-    e: String,
-}
-
-struct CfAccessJwksCache {
-    fetched_at: Instant,
-    keys: Vec<CfAccessJwk>,
-}
-
 #[derive(Deserialize)]
 struct ChatSend {
     text: String,
@@ -399,13 +369,9 @@ async fn main() {
         .unwrap_or(true);
     let public_base_url = std::env::var("PUBLIC_BASE_URL").unwrap_or_default();
     let turnstile_secret = std::env::var("TURNSTILE_SECRET").ok().filter(|val| !val.trim().is_empty());
-    let cf_access_team_domain = std::env::var("CF_ACCESS_TEAM_DOMAIN")
-        .ok()
-        .filter(|val| !val.trim().is_empty());
-    let cf_access_aud = std::env::var("CF_ACCESS_AUD")
-        .or_else(|_| std::env::var("CF_ACCESS_AUDIENCE"))
-        .ok()
-        .filter(|val| !val.trim().is_empty());
+    let cf_access_required = std::env::var("CF_ACCESS_REQUIRED")
+        .map(|val| val.to_lowercase() == "true" || val == "1")
+        .unwrap_or(false);
     let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|v| !v.trim().is_empty());
     let chat_filter_words = std::env::var("CHAT_FILTER_WORDS")
         .ok()
@@ -455,10 +421,8 @@ async fn main() {
             last_ts: Instant::now(),
         }),
         turnstile_secret,
+        cf_access_required,
         viewer_anti_abuse_defaults,
-        cf_access_team_domain,
-        cf_access_aud,
-        cf_access_jwks: RwLock::new(None),
         telegram_bot_token,
         chat_filter_words,
         public_base_url,
@@ -961,7 +925,11 @@ fn read_latency_ms(stream: &Value, numeric_key: &str, fallback_key: &str) -> i64
 }
 
 fn chat_level(count: i64) -> u32 {
-    if count >= 1000 {
+    if count >= 2000 {
+        6
+    } else if count >= 1000 {
+        5
+    } else if count >= 500 {
         4
     } else if count >= 200 {
         3
@@ -1060,7 +1028,6 @@ fn build_cors(origins_raw: &str) -> CorsLayer {
             HeaderName::from_static("content-type"),
             HeaderName::from_static("authorization"),
             HeaderName::from_static("x-requested-with"),
-            HeaderName::from_static("cf-access-jwt-assertion"),
         ])
         .allow_credentials(true)
 }
@@ -1395,22 +1362,6 @@ fn public_media_base(base: &str, headers: &HeaderMap) -> String {
         format!("{scheme}://{rebuilt_host}")
     } else {
         format!("{scheme}://{rebuilt_host}/{base_path}")
-    }
-}
-
-fn resolve_media_base(base: &str, fallback_base: &str, headers: &HeaderMap) -> String {
-    let trimmed = base.trim();
-    if trimmed.is_empty() {
-        return public_media_base(fallback_base, headers);
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return public_media_base(trimmed, headers);
-    }
-    let fallback = public_media_base(fallback_base, headers).trim_end_matches('/').to_string();
-    if trimmed.starts_with('/') {
-        format!("{fallback}{trimmed}")
-    } else {
-        format!("{fallback}/{trimmed}")
     }
 }
 
@@ -2572,12 +2523,13 @@ async fn admin_login(
     headers: HeaderMap,
     Json(payload): Json<LoginPayload>,
 ) -> impl IntoResponse {
-    if cf_access_enabled(&state) && !verify_cf_access(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "access" })));
-    }
     if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
         return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "turnstile" })));
     }
+    if !check_cf_access(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "access" })));
+    }
+
     let authed = if payload.username == state.admin_user && payload.password == state.admin_pass {
         true
     } else {
@@ -2619,7 +2571,7 @@ async fn admin_access_mode(State(state): State<Arc<AppState>>) -> impl IntoRespo
     (
         StatusCode::OK,
         Json(json!({
-            "cf_access_enabled": cf_access_enabled(&state)
+            "cf_access_enabled": state.cf_access_required
         })),
     )
 }
@@ -2645,10 +2597,7 @@ async fn admin_turnstile_login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !cf_access_enabled(&state) {
-        return (StatusCode::BAD_REQUEST, HeaderMap::new(), Json(json!({ "error": "access_not_enabled" })));
-    }
-    if !verify_cf_access(&headers, &state).await {
+    if !check_cf_access(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "access" })));
     }
     (StatusCode::OK, HeaderMap::new(), Json(json!({ "ok": true })))
@@ -3600,86 +3549,17 @@ async fn check_admin_auth(headers: &HeaderMap, state: &AppState) -> bool {
     if !check_bearer(headers, state).await {
         return false;
     }
-    if !cf_access_enabled(state) {
+    check_cf_access(headers, state)
+}
+
+fn check_cf_access(headers: &HeaderMap, state: &AppState) -> bool {
+    if !state.cf_access_required {
         return true;
     }
-    verify_cf_access(headers, state).await
-}
-
-fn cf_access_enabled(state: &AppState) -> bool {
-    state
-        .cf_access_team_domain
-        .as_ref()
-        .is_some_and(|v| !v.trim().is_empty())
-        && state
-            .cf_access_aud
-            .as_ref()
-            .is_some_and(|v| !v.trim().is_empty())
-}
-
-async fn verify_cf_access(headers: &HeaderMap, state: &AppState) -> bool {
-    let Some(token) = headers
+    headers
         .get("CF-Access-Jwt-Assertion")
         .and_then(|val| val.to_str().ok())
-    else {
-        return false;
-    };
-    verify_cf_access_token(state, token).await
-}
-
-async fn verify_cf_access_token(state: &AppState, token: &str) -> bool {
-    let Some(aud) = state.cf_access_aud.as_ref() else {
-        return false;
-    };
-    let header = match decode_header(token) {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-    let kid = header.kid.unwrap_or_default();
-    let Some(keys) = load_cf_access_jwks(state).await else {
-        return false;
-    };
-    let key = keys
-        .iter()
-        .find(|item| !kid.is_empty() && item.kid == kid)
-        .or_else(|| keys.first());
-    let Some(key) = key else { return false };
-    let decoding_key = match DecodingKey::from_rsa_components(&key.n, &key.e) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.set_audience(&[aud.as_str()]);
-    validation.validate_exp = true;
-    validation.leeway = 60;
-    decode::<CfAccessClaims>(token, &decoding_key, &validation).is_ok()
-}
-
-async fn load_cf_access_jwks(state: &AppState) -> Option<Vec<CfAccessJwk>> {
-    let team = state.cf_access_team_domain.as_ref()?;
-    {
-        let cache = state.cf_access_jwks.read().await;
-        if let Some(cache) = cache.as_ref() {
-            if cache.fetched_at.elapsed() < Duration::from_secs(600) {
-                return Some(cache.keys.clone());
-            }
-        }
-    }
-
-    let host = if team.contains('.') {
-        team.trim().to_string()
-    } else {
-        format!("{}.cloudflareaccess.com", team.trim())
-    };
-    let url = format!("https://{}/cdn-cgi/access/certs", host);
-    let resp = Client::new().get(&url).send().await.ok()?;
-    let payload = resp.json::<CfAccessJwks>().await.ok()?;
-    let mut cache = state.cf_access_jwks.write().await;
-    *cache = Some(CfAccessJwksCache {
-        fetched_at: Instant::now(),
-        keys: payload.keys.clone(),
-    });
-    Some(payload.keys)
+        .is_some()
 }
 
 async fn viewer_from_header(headers: &HeaderMap, state: &AppState) -> Option<String> {

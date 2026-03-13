@@ -46,7 +46,7 @@ npm run dev
    - 数据库名：`live_streaming`
 3. 配置环境变量：
    - 复制 `.env.example` → `.env`
-   - 根据实际域名/端口修改（重点：`PORT`、`MEDIAMTX_*`、`TURNSTILE_SECRET`、`CF_ACCESS_*`）
+   - 根据实际域名/端口修改（重点：`PORT`、`MEDIAMTX_*`、`TURNSTILE_SECRET`）
 4. 构建后端：
 
 ```bash
@@ -173,10 +173,8 @@ sudo systemctl status mediamtx
 - `VIEWER_BLOCK_DISPOSABLE_EMAIL`
 - `VIEWER_BLOCK_EDU_GOV_EMAIL`
 - `VIEWER_REGISTER_TOKEN_TTL_SEC`
-- `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`
-- `CF_ACCESS_JWKS_TTL_SEC`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_REPLY_TO`, `SMTP_STARTTLS`
-- `MEDIAMTX_API`, `MEDIAMTX_METRICS`, `MEDIAMTX_WEBRTC`, `MEDIAMTX_HLS`, `MEDIAMTX_LL_HLS`, `MEDIAMTX_PATH`, `MEDIAMTX_POLL_MS`
+- `MEDIAMTX_API`, `MEDIAMTX_METRICS`, `MEDIAMTX_WEBRTC`, `MEDIAMTX_HLS`, `MEDIAMTX_PATH`, `MEDIAMTX_POLL_MS`
 - `HLS_SEGMENT_DURATION_SECS`, `HLS_SEGMENT_COUNT`, `REPLAY_MAX_SECONDS`
 - `CLIP_MIN_SECS`, `CLIP_MAX_SECS`, `CLIP_TTL_SECS`, `CLIP_DIR`, `FFMPEG_BIN`
 - `THUMBNAIL_INTERVAL_SECS`, `THUMBNAIL_SOURCE`
@@ -298,7 +296,6 @@ SRT_FORWARD=srt://127.0.0.1:9001?mode=caller
 
 ## Cloudflare Access（可选）
 
-当配置 `CF_ACCESS_TEAM_DOMAIN` 和 `CF_ACCESS_AUD` 时，管理端接口需要同时满足：
 
 - Admin Bearer Token
 - `CF-Access-Jwt-Assertion` 头（由 Cloudflare Access 注入）
@@ -365,7 +362,7 @@ Example for Linux servers:
    - name: `live_streaming`
 3. Configure environment:
    - copy `.env.example` → `.env`
-   - update `PORT`, `MEDIAMTX_*`, `TURNSTILE_SECRET`, `CF_ACCESS_*`
+   - update `PORT`, `MEDIAMTX_*`, `TURNSTILE_SECRET`
 4. Build backend:
 
 ```bash
@@ -489,10 +486,8 @@ sudo systemctl status mediamtx
 - `VIEWER_BLOCK_DISPOSABLE_EMAIL`
 - `VIEWER_BLOCK_EDU_GOV_EMAIL`
 - `VIEWER_REGISTER_TOKEN_TTL_SEC`
-- `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`
-- `CF_ACCESS_JWKS_TTL_SEC`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_REPLY_TO`, `SMTP_STARTTLS`
-- `MEDIAMTX_API`, `MEDIAMTX_METRICS`, `MEDIAMTX_WEBRTC`, `MEDIAMTX_HLS`, `MEDIAMTX_LL_HLS`, `MEDIAMTX_PATH`, `MEDIAMTX_POLL_MS`
+- `MEDIAMTX_API`, `MEDIAMTX_METRICS`, `MEDIAMTX_WEBRTC`, `MEDIAMTX_HLS`, `MEDIAMTX_PATH`, `MEDIAMTX_POLL_MS`
 - `HLS_SEGMENT_DURATION_SECS`, `HLS_SEGMENT_COUNT`, `REPLAY_MAX_SECONDS`
 - `CLIP_MIN_SECS`, `CLIP_MAX_SECS`, `CLIP_TTL_SECS`, `CLIP_DIR`, `FFMPEG_BIN`
 - `THUMBNAIL_INTERVAL_SECS`, `THUMBNAIL_SOURCE`
@@ -602,7 +597,6 @@ The backend expects:
 
 ## Cloudflare Access (Optional)
 
-When `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` are set, admin APIs require both:
 
 - Admin Bearer Token
 - `CF-Access-Jwt-Assertion` header (injected by Cloudflare Access)

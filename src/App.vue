@@ -40,9 +40,6 @@ const adminSaving = ref(false);
 const actionNotice = ref("");
 const adminSessionOk = ref(false);
 const isAuthed = computed(() => !!adminToken.value || adminSessionOk.value);
-const cfAccessEnabled = ref(false);
-const accessVerified = ref(false);
-const accessChecking = ref(false);
 const smtpConfig = ref({
   host: "",
   port: 587,
@@ -84,10 +81,6 @@ const antiAbuseConfig = ref({
 });
 const antiAbuseSaving = ref(false);
 const antiAbuseNotice = ref("");
-const adminTurnstileToken = ref("");
-const adminTurnstileRef = ref(null);
-let adminTurnstileId = null;
-let adminTurnstileScriptLoading = false;
 const form = ref({
   roomId: "",
   title: "",
@@ -499,10 +492,6 @@ const adminFetch = async (url, payload) => {
 };
 
 const loginAdmin = async () => {
-  if (!adminTurnstileToken.value) {
-    actionNotice.value = "请完成人机验证";
-    return;
-  }
   if (!adminUser.value || !adminPass.value) {
     actionNotice.value = "请输入账号与密码";
     return;
@@ -517,7 +506,6 @@ const loginAdmin = async () => {
       body: JSON.stringify({
         username: adminUser.value,
         password: adminPass.value,
-        turnstileToken: adminTurnstileToken.value,
         rememberDays: adminRememberDays.value || undefined
       })
     });
@@ -560,12 +548,9 @@ const loginAdmin = async () => {
     adminSessionOk.value = true;
     actionNotice.value = "已登录";
     enterAdmin();
-    adminTurnstileToken.value = "";
-    if (window.turnstile) window.turnstile.reset();
   } catch (err) {
     actionNotice.value = err instanceof Error ? err.message : "登录失败";
   } finally {
-    if (window.turnstile) window.turnstile.reset();
     adminSaving.value = false;
     setTimeout(() => {
       actionNotice.value = "";
@@ -762,26 +747,6 @@ const saveTelegram = async () => {
   }
 };
 
-const verifyAccess = async () => {
-  if (!cfAccessEnabled.value) {
-    accessVerified.value = true;
-    return;
-  }
-  accessChecking.value = true;
-  try {
-    const res = await fetch(apiUrl("/api/admin/turnstile-login"), {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({})
-    });
-    accessVerified.value = res.ok;
-  } catch {
-    accessVerified.value = false;
-  } finally {
-    accessChecking.value = false;
-  }
-};
 
 const loadViewerAntiAbuse = async () => {
   try {
@@ -1012,53 +977,7 @@ const connectWs = () => {
 };
 
   onMounted(() => {
-    const detectAccess = () =>
-      fetch("/cdn-cgi/access/get-identity")
-        .then((res) => res.ok)
-        .catch(() => false);
-
-  const apiHostDiff = (() => {
-    try {
-      const base = apiBase();
-      const url = new URL(base);
-      return url.host !== window.location.host;
-    } catch {
-      return false;
-    }
-  })();
-
-    Promise.all([
-      fetch(apiUrl("/api/admin/access-mode"), {
-        credentials: "include"
-      })
-        .then((res) => (res.ok ? res.json() : null))
-        .then((data) => {
-          if (data && typeof data.cf_access_enabled === "boolean") {
-          return data.cf_access_enabled;
-        }
-        return null;
-      })
-      .catch(() => null),
-    detectAccess()
-  ]).then(([apiFlag, identityOk]) => {
-    if (apiFlag !== null) {
-      cfAccessEnabled.value = apiFlag;
-      return;
-    }
-    if (identityOk) {
-      cfAccessEnabled.value = true;
-      return;
-    }
-    cfAccessEnabled.value = apiHostDiff ? true : false;
-  });
-  watch(() => !isAuthed.value, (show) => {
-    if (show) renderAdminTurnstile();
-  }, { immediate: true });
-    watch(cfAccessEnabled, () => {
-      if (!isAuthed.value) renderAdminTurnstile();
-      verifyAccess();
-    });
-    verifyAccess();
+  watch(() => !isAuthed.value, () => {}, { immediate: true });
     if (adminToken.value) {
       enterAdmin();
     } else {
@@ -1068,42 +987,6 @@ const connectWs = () => {
   }
 });
 
-  const renderAdminTurnstile = async () => {
-    await nextTick();
-    if (!window.turnstile) {
-      if (!adminTurnstileScriptLoading) {
-        adminTurnstileScriptLoading = true;
-        const existing = document.getElementById("turnstile-script");
-        if (!existing) {
-          const script = document.createElement("script");
-          script.id = "turnstile-script";
-          script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js";
-          script.async = true;
-          script.defer = true;
-          script.onload = () => renderAdminTurnstile();
-          document.body.appendChild(script);
-          return;
-        }
-      }
-      return;
-    }
-    if (!window.turnstile || !adminTurnstileRef.value) return;
-    if (adminTurnstileId) {
-      if (adminTurnstileRef.value.childElementCount === 0) {
-        window.turnstile.remove(adminTurnstileId);
-        adminTurnstileId = null;
-      } else {
-        window.turnstile.reset(adminTurnstileId);
-        return;
-      }
-    }
-    adminTurnstileId = window.turnstile.render(adminTurnstileRef.value, {
-      sitekey: "0x4AAAAAACncUgjk6YpyY6aB",
-      callback: (token) => {
-        adminTurnstileToken.value = token;
-      }
-    });
-  };
 
 const normalizeSchedule = (items) => {
   if (!Array.isArray(items)) return [];
@@ -1193,11 +1076,6 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="mt-6 grid gap-4">
-              <div v-if="cfAccessEnabled" class="text-xs text-[#8f6aa2]">
-                <span v-if="accessChecking">Access 校验中...</span>
-                <span v-else-if="accessVerified">Access 已通过，可登录</span>
-                <span v-else>Access 未通过，请先完成 Cloudflare Access 登录</span>
-              </div>
               <div class="field-group">
                 <label class="field-label">管理员账号 / 邮箱</label>
                 <input v-model="adminUser" class="field-input" placeholder="admin 或 meow@example.com" />
@@ -1224,12 +1102,8 @@ onBeforeUnmount(() => {
                   </select>
                 </div>
               </div>
-              <div class="field-group">
-                <label class="field-label">人机验证</label>
-                <div ref="adminTurnstileRef"></div>
-              </div>
               <div class="flex flex-wrap gap-2">
-                <button class="meow-btn-primary motion-press" type="button" :disabled="adminSaving || !adminTurnstileToken || (cfAccessEnabled && !accessVerified)" @click="loginAdmin">
+                <button class="meow-btn-primary motion-press" type="button" :disabled="adminSaving" @click="loginAdmin">
                   登录
                 </button>
               </div>
