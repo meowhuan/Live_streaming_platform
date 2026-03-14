@@ -119,7 +119,7 @@ const channelCards = ref([]);
 const opsAlerts = ref([]);
 const ingestNodes = ref([]);
 const ingestConfig = ref([]);
-const ingestInfo = ref({ srt: "", token: "" });
+const ingestInfo = ref({ srt: "", rtmp: "", rtsp: "", token: "" });
 const playInfo = ref({ whep: "", hls: "" });
 const ingestDisplay = ref([]);
 const metricsInfo = ref({});
@@ -213,7 +213,7 @@ const loadAll = async () => {
     channelCards.value = channelsRes.items || [];
     opsAlerts.value = alertsRes.items || [];
     ingestNodes.value = nodesRes.items || [];
-    ingestInfo.value = ingestInfoRes || { srt: "", token: "" };
+    ingestInfo.value = ingestInfoRes || { srt: "", rtmp: "", rtsp: "", token: "" };
     playInfo.value = playInfoRes || { whep: "", hls: "" };
     metricsInfo.value = metricsRes.items || {};
     ingestDisplay.value = [
@@ -221,6 +221,22 @@ const loadAll = async () => {
         ? [{
             protocol: "SRT",
             url: ingestInfo.value.srt,
+            note: "后端签发推流地址",
+            tag: "推流"
+          }]
+        : []),
+      ...(ingestInfo.value.rtmp
+        ? [{
+            protocol: "RTMP",
+            url: ingestInfo.value.rtmp,
+            note: "后端签发推流地址",
+            tag: "推流"
+          }]
+        : []),
+      ...(ingestInfo.value.rtsp
+        ? [{
+            protocol: "RTSP",
+            url: ingestInfo.value.rtsp,
             note: "后端签发推流地址",
             tag: "推流"
           }]

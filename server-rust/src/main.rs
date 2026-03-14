@@ -64,6 +64,7 @@ struct AppState {
     email_echo: bool,
     smtp: RwLock<Option<SmtpConfig>>,
     metrics_state: RwLock<MetricsState>,
+    health_metrics_state: RwLock<MetricsState>,
     turnstile_secret: Option<String>,
     viewer_anti_abuse_defaults: ViewerAntiAbuseConfig,
     cf_access_required: bool,
@@ -421,6 +422,11 @@ async fn main() {
         email_echo,
         smtp: RwLock::new(smtp),
         metrics_state: RwLock::new(MetricsState {
+            last_rx_bytes: None,
+            last_tx_bytes: None,
+            last_ts: Instant::now(),
+        }),
+        health_metrics_state: RwLock::new(MetricsState {
             last_rx_bytes: None,
             last_tx_bytes: None,
             last_ts: Instant::now(),
@@ -1277,6 +1283,9 @@ async fn get_stream_status(State(state): State<Arc<AppState>>) -> impl IntoRespo
 }
 
 async fn get_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(items) = build_health_from_metrics(&state).await {
+        return Json(json!({ "updatedAt": now_iso(), "items": items }));
+    }
     let health = get_json(&state.pool, "health", default_kv()[2].1.clone()).await;
     Json(json!({ "updatedAt": now_iso(), "items": health }))
 }
@@ -2628,6 +2637,112 @@ async fn compute_bitrate_mbps(
     }
     metrics.last_ts = now;
     bitrate
+}
+
+async fn compute_health_rates_mbps(
+    state: &AppState,
+    rx_bytes: Option<f64>,
+    tx_bytes: Option<f64>,
+) -> (Option<f64>, Option<f64>) {
+    let mut metrics = state.health_metrics_state.write().await;
+    let now = Instant::now();
+    let elapsed = now.duration_since(metrics.last_ts).as_secs_f64();
+    if elapsed <= 0.1 {
+        return (None, None);
+    }
+    let mut rx_mbps = None;
+    let mut tx_mbps = None;
+    if let Some(rx) = rx_bytes {
+        if let Some(prev) = metrics.last_rx_bytes {
+            let delta = rx - prev;
+            if delta >= 0.0 {
+                rx_mbps = Some((delta * 8.0) / elapsed / 1_000_000.0);
+            }
+        }
+        metrics.last_rx_bytes = Some(rx);
+    }
+    if let Some(tx) = tx_bytes {
+        if let Some(prev) = metrics.last_tx_bytes {
+            let delta = tx - prev;
+            if delta >= 0.0 {
+                tx_mbps = Some((delta * 8.0) / elapsed / 1_000_000.0);
+            }
+        }
+        metrics.last_tx_bytes = Some(tx);
+    }
+    metrics.last_ts = now;
+    (rx_mbps, tx_mbps)
+}
+
+fn score_bitrate(mbps: Option<f64>) -> i64 {
+    let Some(mbps) = mbps else { return 0 };
+    if mbps >= 8.0 { 100 }
+    else if mbps >= 5.0 { 85 }
+    else if mbps >= 2.0 { 70 }
+    else if mbps >= 1.0 { 50 }
+    else if mbps > 0.1 { 30 }
+    else { 10 }
+}
+
+fn score_latency(latency: Option<f64>) -> i64 {
+    let Some(latency) = latency else { return 0 };
+    if latency <= 0.3 { 100 }
+    else if latency <= 0.8 { 85 }
+    else if latency <= 1.5 { 70 }
+    else if latency <= 3.0 { 50 }
+    else { 30 }
+}
+
+fn score_readers(readers: Option<f64>) -> i64 {
+    let Some(readers) = readers else { return 0 };
+    if readers >= 100.0 { 100 }
+    else if readers >= 50.0 { 85 }
+    else if readers >= 10.0 { 70 }
+    else if readers >= 1.0 { 50 }
+    else { 20 }
+}
+
+async fn build_health_from_metrics(state: &Arc<AppState>) -> Option<Value> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let body = fetch_mediamtx_metrics(&client, &state).await?;
+    let rx_bytes = metric_value_for_path(
+        &body,
+        &[
+            "mediamtx_path_bytes_received_total",
+            "mediamtx_path_source_bytes_received_total",
+        ],
+        &state.mediamtx_path,
+    );
+    let tx_bytes = metric_value_for_path(
+        &body,
+        &["mediamtx_path_bytes_sent_total"],
+        &state.mediamtx_path,
+    );
+    let latency = metric_value_for_path(
+        &body,
+        &["mediamtx_path_source_latency_seconds", "mediamtx_path_source_latency"],
+        &state.mediamtx_path,
+    );
+    let readers = metric_value_for_path(
+        &body,
+        &["mediamtx_path_readers"],
+        &state.mediamtx_path,
+    );
+    let (rx_mbps, tx_mbps) = compute_health_rates_mbps(&state, rx_bytes, tx_bytes).await;
+    let rx_note = rx_mbps.map(|v| format!("{:.2} Mbps", v)).unwrap_or_else(|| "暂无".to_string());
+    let tx_note = tx_mbps.map(|v| format!("{:.2} Mbps", v)).unwrap_or_else(|| "暂无".to_string());
+    let latency_note = latency.map(|v| format!("{:.2}s", v)).unwrap_or_else(|| "暂无".to_string());
+    let readers_note = readers.map(|v| format!("{:.0} 观众", v)).unwrap_or_else(|| "暂无".to_string());
+
+    Some(json!([
+        { "label": "推流输入带宽", "value": score_bitrate(rx_mbps), "note": rx_note },
+        { "label": "推流输出带宽", "value": score_bitrate(tx_mbps), "note": tx_note },
+        { "label": "源延迟", "value": score_latency(latency), "note": latency_note },
+        { "label": "活跃观众", "value": score_readers(readers), "note": readers_note }
+    ]))
 }
 
 async fn admin_login(
