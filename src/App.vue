@@ -70,7 +70,6 @@ const notifyTemplates = ref({
 const notifyRulesRaw = ref("[]");
 const notifySaving = ref(false);
 const notifyNotice = ref("");
-const showAnnouncementModal = ref(false);
 const announcementDraft = ref({ title: "", message: "", url: "" });
 const announcementSending = ref(false);
 const announcementNotice = ref("");
@@ -732,16 +731,6 @@ const saveNotifyTemplates = async () => {
   }
 };
 
-const openAnnouncementModal = () => {
-  announcementNotice.value = "";
-  showAnnouncementModal.value = true;
-};
-
-const closeAnnouncementModal = () => {
-  showAnnouncementModal.value = false;
-  announcementNotice.value = "";
-};
-
 const sendAnnouncement = async () => {
   const title = announcementDraft.value.title.trim();
   const message = announcementDraft.value.message.trim();
@@ -759,7 +748,10 @@ const sendAnnouncement = async () => {
   announcementSending.value = false;
   if (ok) {
     announcementDraft.value = { title: "", message: "", url: "" };
-    closeAnnouncementModal();
+    announcementNotice.value = "公告已发送";
+    setTimeout(() => {
+      announcementNotice.value = "";
+    }, 2000);
   } else {
     announcementNotice.value = announcementNotice.value || "发送失败";
   }
@@ -1166,42 +1158,6 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <div v-if="showAnnouncementModal" class="auth-overlay" @click.self="closeAnnouncementModal">
-          <div class="auth-card" :class="isNight ? 'auth-card-night' : 'auth-card-day'">
-            <div class="flex items-center justify-between">
-              <div>
-                <div class="text-xs uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">Announcement</div>
-                <div class="font-display text-2xl mt-1">发布弹窗公告</div>
-              </div>
-              <button class="meow-pill motion-press text-[11px]" type="button" @click="closeAnnouncementModal">
-                关闭
-              </button>
-            </div>
-            <div class="mt-6 grid gap-4">
-              <div class="field-group">
-                <label class="field-label">公告标题</label>
-                <input v-model="announcementDraft.title" class="field-input" placeholder="标题" />
-              </div>
-              <div class="field-group">
-                <label class="field-label">公告内容</label>
-                <textarea v-model="announcementDraft.message" class="field-input min-h-[120px]" placeholder="请输入公告内容"></textarea>
-              </div>
-              <div class="field-group">
-                <label class="field-label">跳转链接（可选）</label>
-                <input v-model="announcementDraft.url" class="field-input" placeholder="https://..." />
-              </div>
-              <div class="flex flex-wrap items-center gap-2">
-                <button class="meow-btn-primary motion-press" type="button" :disabled="announcementSending" @click="sendAnnouncement">
-                  发送公告
-                </button>
-                <button class="meow-btn-ghost motion-press" type="button" @click="closeAnnouncementModal">
-                  取消
-                </button>
-                <span v-if="announcementNotice" class="text-xs text-[#e06b8b]">{{ announcementNotice }}</span>
-              </div>
-            </div>
-          </div>
-        </div>
 
         <div v-if="isAuthed" class="mx-auto w-[min(1100px,92vw)] pb-20 pt-8 relative">
         <button
@@ -1242,6 +1198,7 @@ onBeforeUnmount(() => {
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#ingest">推流配置</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#smtp">SMTP</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#notify">通知</a>
+            <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#announcement">公告</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#anti-abuse">防盗刷</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#schedule">排期</a>
             <a class="nav-link" :class="isNight ? 'hover:text-meow-night-ink' : 'hover:text-meow-ink'" href="#channels">频道</a>
@@ -1770,14 +1727,9 @@ onBeforeUnmount(() => {
                   支持占位符与正则规则，自动拼接直播地址。
                 </p>
               </div>
-              <div class="flex items-center gap-2">
-                <button class="meow-btn-primary motion-press" type="button" @click="openAnnouncementModal">
-                  发布公告
-                </button>
-                <button class="meow-btn-ghost motion-press" type="button" @click="loadNotifyTemplates">
-                  刷新
-                </button>
-              </div>
+              <button class="meow-btn-ghost motion-press" type="button" @click="loadNotifyTemplates">
+                刷新
+              </button>
             </div>
             <div class="mt-5 grid gap-4 md:grid-cols-2">
               <div class="field-group">
@@ -1836,6 +1788,42 @@ onBeforeUnmount(() => {
                 保存模板
               </button>
               <span v-if="notifyNotice" class="text-xs text-[#e06b8b]">{{ notifyNotice }}</span>
+            </div>
+          </div>
+        </section>
+
+        <section id="announcement" class="mt-14">
+          <div
+            class="meow-card motion-card p-5"
+            :class="isNight ? 'bg-meow-night-card/80 border-meow-night-line' : ''"
+          >
+            <div class="flex items-center justify-between gap-4">
+              <div>
+                <h3 class="font-display text-xl">弹窗公告</h3>
+                <p class="mt-2 text-sm" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+                  编写后将以弹窗形式推送到观众端。
+                </p>
+              </div>
+            </div>
+            <div class="mt-5 grid gap-4 md:grid-cols-2">
+              <div class="field-group md:col-span-2">
+                <label class="field-label">公告标题</label>
+                <input v-model="announcementDraft.title" class="field-input" placeholder="标题" />
+              </div>
+              <div class="field-group md:col-span-2">
+                <label class="field-label">公告内容</label>
+                <textarea v-model="announcementDraft.message" class="field-input min-h-[120px]" placeholder="请输入公告内容"></textarea>
+              </div>
+              <div class="field-group md:col-span-2">
+                <label class="field-label">跳转链接（可选）</label>
+                <input v-model="announcementDraft.url" class="field-input" placeholder="https://..." />
+              </div>
+            </div>
+            <div class="mt-4 flex flex-wrap items-center gap-3">
+              <button class="meow-btn-primary motion-press" type="button" :disabled="announcementSending" @click="sendAnnouncement">
+                发送公告
+              </button>
+              <span v-if="announcementNotice" class="text-xs text-[#e06b8b]">{{ announcementNotice }}</span>
             </div>
           </div>
         </section>
