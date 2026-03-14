@@ -30,6 +30,7 @@ use lettre::{
     transport::smtp::authentication::Credentials,
     Tokio1Executor,
 };
+use std::net::IpAddr;
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio::process::Command;
@@ -56,6 +57,8 @@ struct AppState {
     mediamtx_path: String,
     mediamtx_webrtc: String,
     mediamtx_hls: String,
+    mediamtx_rtsp: String,
+    mediamtx_rtmp: String,
     pending_viewer_codes: RwLock<HashMap<String, PendingCode>>,
     email_code_ttl: Duration,
     email_echo: bool,
@@ -67,6 +70,7 @@ struct AppState {
     telegram_bot_token: Option<String>,
     chat_filter_words: Vec<String>,
     public_base_url: String,
+    public_ip: RwLock<Option<String>>,
     live_count_fallback_secs: u64,
     stats_last_written: RwLock<Instant>,
     replay_max_seconds: u64,
@@ -350,6 +354,8 @@ async fn main() {
     let mediamtx_path = std::env::var("MEDIAMTX_PATH").unwrap_or_else(|_| "live/stream".to_string());
     let mediamtx_webrtc = std::env::var("MEDIAMTX_WEBRTC").unwrap_or_else(|_| "http://127.0.0.1:8889".to_string());
     let mediamtx_hls = std::env::var("MEDIAMTX_HLS").unwrap_or_else(|_| "http://127.0.0.1:8888".to_string());
+    let mediamtx_rtsp = std::env::var("MEDIAMTX_RTSP").unwrap_or_else(|_| "rtsp://127.0.0.1:8554".to_string());
+    let mediamtx_rtmp = std::env::var("MEDIAMTX_RTMP").unwrap_or_else(|_| "rtmp://127.0.0.1:1935".to_string());
     let mediamtx_poll = env_u64("MEDIAMTX_POLL_MS", 2000);
     let hls_segment_duration_secs = env_u64("HLS_SEGMENT_DURATION_SECS", 2);
     let hls_segment_count = env_u64("HLS_SEGMENT_COUNT", 60);
@@ -366,6 +372,7 @@ async fn main() {
         .map(|val| val.to_lowercase() != "false")
         .unwrap_or(true);
     let public_base_url = std::env::var("PUBLIC_BASE_URL").unwrap_or_default();
+    let public_ip = std::env::var("PUBLIC_IP").ok().filter(|v| !v.trim().is_empty());
     let turnstile_secret = std::env::var("TURNSTILE_SECRET").ok().filter(|val| !val.trim().is_empty());
     let cf_access_required = std::env::var("CF_ACCESS_REQUIRED")
         .map(|val| val.to_lowercase() == "true" || val == "1")
@@ -407,6 +414,8 @@ async fn main() {
         mediamtx_path,
         mediamtx_webrtc,
         mediamtx_hls,
+        mediamtx_rtsp,
+        mediamtx_rtmp,
         pending_viewer_codes: RwLock::new(HashMap::new()),
         email_code_ttl,
         email_echo,
@@ -422,6 +431,7 @@ async fn main() {
         telegram_bot_token,
         chat_filter_words,
         public_base_url,
+        public_ip: RwLock::new(public_ip),
         live_count_fallback_secs,
         stats_last_written: RwLock::new(Instant::now() - Duration::from_secs(3600)),
         replay_max_seconds,
@@ -814,9 +824,21 @@ fn default_kv() -> Vec<(String, Value)> {
     let ingest = json!([
         {
             "protocol": "SRT",
-            "url": "srt://127.0.0.1:9000",
+            "url": "srt://your_public_ip:9000",
             "note": "本地测试线路（监听端口 9000）",
             "tag": "本地测试"
+        },
+        {
+            "protocol": "RTMP",
+            "url": "rtmp://your_public_ip:1935/live/stream?token=your_token",
+            "note": "TCP 备选线路（MediaMTX 1935）",
+            "tag": "备选线路"
+        },
+        {
+            "protocol": "RTSP",
+            "url": "rtsp://your_public_ip:8554/live/stream?token=your_token",
+            "note": "TCP 备选线路（MediaMTX 8554）",
+            "tag": "备选线路"
         },
         {
             "protocol": "OBS",
@@ -1266,12 +1288,18 @@ async fn get_ingest(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn get_stream_ingest(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let publish = ensure_stream_tokens(&state).await;
+    let public_host = resolve_public_host(&state).await;
     let srt_url = format!(
-        "srt://127.0.0.1:8890?streamid=publish:{}:token:{}",
+        "srt://{}:8890?streamid=publish:{}:token:{}",
+        public_host,
         state.mediamtx_path, publish
     );
+    let rtmp_url = build_push_url(&state.mediamtx_rtmp, &public_host, &state.mediamtx_path, &publish);
+    let rtsp_url = build_push_url(&state.mediamtx_rtsp, &public_host, &state.mediamtx_path, &publish);
     Json(json!({
         "srt": srt_url,
+        "rtmp": rtmp_url,
+        "rtsp": rtsp_url,
         "token": publish
     }))
 }
@@ -1356,6 +1384,96 @@ fn public_media_base(base: &str, headers: &HeaderMap) -> String {
         format!("{scheme}://{rebuilt_host}")
     } else {
         format!("{scheme}://{rebuilt_host}/{base_path}")
+    }
+}
+
+async fn resolve_public_host(state: &Arc<AppState>) -> String {
+    if let Some(ip) = state.public_ip.read().await.clone() {
+        return normalize_host(&ip);
+    }
+    if let Some(ip) = fetch_public_ip().await {
+        let normalized = normalize_host(&ip);
+        let mut cached = state.public_ip.write().await;
+        *cached = Some(ip);
+        return normalized;
+    }
+    if let Some(host) = host_from_public_base(&state.public_base_url) {
+        return normalize_host(&host);
+    }
+    "127.0.0.1".to_string()
+}
+
+async fn fetch_public_ip() -> Option<String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let resp = client.get("https://api.ipify.org").send().await.ok()?;
+    let text = resp.text().await.ok()?;
+    let ip = text.trim();
+    if ip.is_empty() {
+        return None;
+    }
+    if ip.parse::<IpAddr>().is_ok() {
+        Some(ip.to_string())
+    } else {
+        None
+    }
+}
+
+fn host_from_public_base(base: &str) -> Option<String> {
+    let trimmed = base.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let rest = trimmed.split_once("://").map(|(_, r)| r).unwrap_or(trimmed);
+    let (host_port, _) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, _) = split_host_port(host_port);
+    if host.is_empty() || is_local_host(&host) {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+fn normalize_host(host: &str) -> String {
+    let trimmed = host.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        return trimmed.to_string();
+    }
+    if let Ok(addr) = trimmed.parse::<IpAddr>() {
+        if addr.is_ipv6() {
+            return format!("[{trimmed}]");
+        }
+    }
+    trimmed.to_string()
+}
+
+fn build_push_url(base: &str, public_host: &str, path: &str, token: &str) -> String {
+    let base_with_host = ingest_base(base, public_host);
+    let url = format!(
+        "{}/{}",
+        base_with_host.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    append_token(&url, token)
+}
+
+fn ingest_base(base: &str, public_host: &str) -> String {
+    let (scheme, rest) = base.split_once("://").unwrap_or(("rtmp", base));
+    let (base_host_port, base_path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (base_host, base_port) = split_host_port(base_host_port);
+    let host_port = if !base_host.is_empty() && !is_local_host(&base_host) {
+        base_host_port.to_string()
+    } else if let Some(port) = base_port {
+        format!("{}:{}", public_host, port)
+    } else {
+        public_host.to_string()
+    };
+    if base_path.is_empty() {
+        format!("{scheme}://{host_port}")
+    } else {
+        format!("{scheme}://{host_port}/{base_path}")
     }
 }
 
@@ -3372,11 +3490,15 @@ async fn admin_room_create(
     set_json(&state.pool, "stream", &stream).await;
     broadcast(&state, "stream:update", &stream);
 
+    let public_host = resolve_public_host(&state).await;
     let srt_url = format!(
-        "srt://127.0.0.1:8890?streamid=publish:{}:token:{}",
+        "srt://{}:8890?streamid=publish:{}:token:{}",
+        public_host,
         state.mediamtx_path,
         key
     );
+    let rtmp_url = build_push_url(&state.mediamtx_rtmp, &public_host, &state.mediamtx_path, &key);
+    let rtsp_url = build_push_url(&state.mediamtx_rtsp, &public_host, &state.mediamtx_path, &key);
 
     let ingest = json!([
         {
@@ -3384,6 +3506,18 @@ async fn admin_room_create(
             "url": srt_url,
             "note": "本地测试线路（监听端口 9000）",
             "tag": "本地测试"
+        },
+        {
+            "protocol": "RTMP",
+            "url": rtmp_url,
+            "note": "TCP 备选线路（MediaMTX 1935）",
+            "tag": "备选线路"
+        },
+        {
+            "protocol": "RTSP",
+            "url": rtsp_url,
+            "note": "TCP 备选线路（MediaMTX 8554）",
+            "tag": "备选线路"
         },
         {
             "protocol": "OBS",
@@ -3402,7 +3536,7 @@ async fn admin_room_create(
     broadcast(&state, "ingest:update", &ingest);
 
     let read = ensure_read_token(&state).await;
-    (StatusCode::OK, Json(json!({ "ok": true, "roomId": room_id, "key": key, "srtUrl": srt_url, "readToken": read })))
+    (StatusCode::OK, Json(json!({ "ok": true, "roomId": room_id, "key": key, "srtUrl": srt_url, "rtmpUrl": rtmp_url, "rtspUrl": rtsp_url, "readToken": read })))
 }
 
 async fn admin_ingest_refresh(
@@ -3420,13 +3554,17 @@ async fn admin_ingest_refresh(
     }
     set_json(&state.pool, "publish_token", &json!(next)).await;
 
+    let public_host = resolve_public_host(&state).await;
     let srt_url = format!(
-        "srt://127.0.0.1:8890?streamid=publish:{}:token:{}",
+        "srt://{}:8890?streamid=publish:{}:token:{}",
+        public_host,
         state.mediamtx_path,
         next
     );
+    let rtmp_url = build_push_url(&state.mediamtx_rtmp, &public_host, &state.mediamtx_path, &next);
+    let rtsp_url = build_push_url(&state.mediamtx_rtsp, &public_host, &state.mediamtx_path, &next);
 
-    (StatusCode::OK, Json(json!({ "ok": true, "srt": srt_url, "token": next })))
+    (StatusCode::OK, Json(json!({ "ok": true, "srt": srt_url, "rtmp": rtmp_url, "rtsp": rtsp_url, "token": next })))
 }
 
 async fn ws_handler(
