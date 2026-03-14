@@ -1389,16 +1389,16 @@ fn public_media_base(base: &str, headers: &HeaderMap) -> String {
 
 async fn resolve_public_host(state: &Arc<AppState>) -> String {
     if let Some(ip) = state.public_ip.read().await.clone() {
-        return normalize_host(&ip);
+        return normalize_public_host(&ip);
     }
     if let Some(ip) = fetch_public_ip().await {
-        let normalized = normalize_host(&ip);
+        let normalized = normalize_public_host(&ip);
         let mut cached = state.public_ip.write().await;
         *cached = Some(ip);
         return normalized;
     }
     if let Some(host) = host_from_public_base(&state.public_base_url) {
-        return normalize_host(&host);
+        return normalize_public_host(&host);
     }
     "127.0.0.1".to_string()
 }
@@ -1436,7 +1436,7 @@ fn host_from_public_base(base: &str) -> Option<String> {
     }
 }
 
-fn normalize_host(host: &str) -> String {
+fn normalize_public_host(host: &str) -> String {
     let trimmed = host.trim();
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         return trimmed.to_string();
