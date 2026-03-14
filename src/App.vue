@@ -73,6 +73,7 @@ const notifyNotice = ref("");
 const announcementDraft = ref({ title: "", message: "", url: "" });
 const announcementSending = ref(false);
 const announcementNotice = ref("");
+const announcementPreview = computed(() => renderMarkdown(announcementDraft.value.message || ""));
 const antiAbuseConfig = ref({
   verifyEmailRateLimitWindowSecs: 1800,
   verifyEmailRateLimitMax: 3,
@@ -358,6 +359,30 @@ const parseNumber = (value) => {
   if (!value) return null;
   const parsed = Number.parseFloat(String(value).replace(/[^0-9.]+/g, ""));
   return Number.isNaN(parsed) ? null : parsed;
+};
+
+const escapeHtml = (input) => input
+  .replace(/&/g, "&amp;")
+  .replace(/</g, "&lt;")
+  .replace(/>/g, "&gt;")
+  .replace(/\"/g, "&quot;")
+  .replace(/'/g, "&#39;");
+
+const renderMarkdown = (input) => {
+  if (!input) return "";
+  let text = escapeHtml(String(input)).replace(/\r\n/g, "\n");
+  text = text.replace(/^### (.*)$/gm, "<h3>$1</h3>");
+  text = text.replace(/^## (.*)$/gm, "<h2>$1</h2>");
+  text = text.replace(/^# (.*)$/gm, "<h1>$1</h1>");
+  text = text.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  text = text.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  text = text.replace(/`([^`]+)`/g, "<code>$1</code>");
+  text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  text = text.replace(/^\s*-\s+(.+)$/gm, "<li>$1</li>");
+  text = text.replace(/(?:<li>.*<\/li>\n?)+/g, (block) => `<ul>${block}</ul>`);
+  text = text.replace(/\n{2,}/g, "<br/><br/>");
+  text = text.replace(/\n/g, "<br/>");
+  return text;
 };
 
 const parseBitrateMbps = (value) => {
@@ -1818,6 +1843,14 @@ onBeforeUnmount(() => {
                 <label class="field-label">跳转链接（可选）</label>
                 <input v-model="announcementDraft.url" class="field-input" placeholder="https://..." />
               </div>
+            </div>
+            <div class="mt-4">
+              <div class="text-xs uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">Markdown 预览</div>
+              <div
+                class="markdown-content mt-2 rounded-xl border border-meow-line/60 bg-white/60 p-4 text-sm"
+                :class="isNight ? 'bg-meow-night-bg/40 border-meow-night-line/60 text-meow-night-soft' : 'text-meow-soft'"
+                v-html="announcementPreview"
+              ></div>
             </div>
             <div class="mt-4 flex flex-wrap items-center gap-3">
               <button class="meow-btn-primary motion-press" type="button" :disabled="announcementSending" @click="sendAnnouncement">

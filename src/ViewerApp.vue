@@ -29,7 +29,21 @@ const viewerSubscriptions = ref({ live: false, schedule: false, email: false });
 const notifyBanner = ref("");
 const announcementModal = ref(null);
 const showAnnouncementModal = ref(false);
+const announcementSuppress = ref(false);
+const announcementSnooze = ref(localStorage.getItem("announcement_snooze") === "1");
+const announcementDismissedId = ref(localStorage.getItem("announcement_dismissed_id") || "");
 const closeAnnouncementModal = () => {
+  if (announcementModal.value) {
+    if (announcementSuppress.value) {
+      announcementSnooze.value = true;
+      announcementDismissedId.value = String(announcementModal.value.id || "");
+      localStorage.setItem("announcement_snooze", "1");
+      localStorage.setItem("announcement_dismissed_id", announcementDismissedId.value);
+    } else {
+      announcementSnooze.value = false;
+      localStorage.setItem("announcement_snooze", "0");
+    }
+  }
   showAnnouncementModal.value = false;
   announcementModal.value = null;
 };
@@ -377,6 +391,7 @@ const loadAll = async () => {
       opsAlerts.value = opsRes?.items || [];
       chatMessages.value = (chatRes?.items || []).map(normalizeChatMessage);
       notifications.value = notifyRes?.items || [];
+      syncLatestAnnouncementFromList();
       if (streamRes) playerError.value = "";
     const extraResults = await Promise.allSettled([
       fetchJson("/api/stream/play"),
@@ -472,8 +487,7 @@ const applyUpdate = (type, data) => {
         }, 3000);
       }
       if (data?.type === "announcement") {
-        announcementModal.value = data;
-        showAnnouncementModal.value = true;
+        openAnnouncement(data, true);
       }
       break;
     default:
@@ -503,7 +517,10 @@ const connectWs = () => {
         if (payload.data?.stream) stream.value = payload.data.stream;
         if (payload.data?.schedule) scheduleList.value = payload.data.schedule;
         if (payload.data?.opsAlerts) opsAlerts.value = payload.data.opsAlerts;
-        if (payload.data?.notifications) notifications.value = payload.data.notifications;
+        if (payload.data?.notifications) {
+          notifications.value = payload.data.notifications;
+          syncLatestAnnouncementFromList();
+        }
         if (payload.data?.chat?.items) chatMessages.value = payload.data.chat.items.map(normalizeChatMessage);
       } else if (payload.type && payload.data) {
         applyUpdate(payload.type, payload.data);
@@ -576,6 +593,64 @@ const parseLatencyMs = (value) => {
   const lower = String(value).toLowerCase();
   if (lower.includes("s") && !lower.includes("ms")) return num * 1000;
   return num;
+};
+
+const escapeHtml = (input) => input
+  .replace(/&/g, "&amp;")
+  .replace(/</g, "&lt;")
+  .replace(/>/g, "&gt;")
+  .replace(/\"/g, "&quot;")
+  .replace(/'/g, "&#39;");
+
+const renderMarkdown = (input) => {
+  if (!input) return "";
+  let text = escapeHtml(String(input)).replace(/\r\n/g, "\n");
+  text = text.replace(/^### (.*)$/gm, "<h3>$1</h3>");
+  text = text.replace(/^## (.*)$/gm, "<h2>$1</h2>");
+  text = text.replace(/^# (.*)$/gm, "<h1>$1</h1>");
+  text = text.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  text = text.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  text = text.replace(/`([^`]+)`/g, "<code>$1</code>");
+  text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  text = text.replace(/^\s*-\s+(.+)$/gm, "<li>$1</li>");
+  text = text.replace(/(?:<li>.*<\/li>\n?)+/g, (block) => `<ul>${block}</ul>`);
+  text = text.replace(/\n{2,}/g, "<br/><br/>");
+  text = text.replace(/\n/g, "<br/>");
+  return text;
+};
+
+const announcementHtml = computed(() => renderMarkdown(announcementModal.value?.message || ""));
+
+const shouldSuppressAnnouncement = (item) => {
+  if (!item) return false;
+  return announcementSnooze.value && announcementDismissedId.value === String(item.id || "");
+};
+
+const openAnnouncement = (item, force = false) => {
+  if (!item) return;
+  const id = String(item.id || "");
+  if (!force && shouldSuppressAnnouncement(item)) return;
+  if (announcementModal.value?.id === item.id && showAnnouncementModal.value) return;
+  if (announcementDismissedId.value && announcementDismissedId.value !== id) {
+    announcementSnooze.value = false;
+    localStorage.setItem("announcement_snooze", "0");
+  }
+  announcementModal.value = item;
+  announcementSuppress.value = shouldSuppressAnnouncement(item);
+  showAnnouncementModal.value = true;
+};
+
+const syncLatestAnnouncementFromList = () => {
+  if (!notifications.value.length) return;
+  const latest = [...notifications.value].reverse().find((item) => item.type === "announcement");
+  if (latest) openAnnouncement(latest, false);
+};
+
+const formatTime = (value) => {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleTimeString("zh-CN");
 };
 
 const bitrateStatus = () => {
@@ -1445,13 +1520,21 @@ watch(isMobile, () => {
             关闭
           </button>
         </div>
-        <p class="mt-4 text-sm leading-relaxed" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
-          {{ announcementModal.message }}
-        </p>
+        <div
+          class="markdown-content mt-4 text-sm leading-relaxed"
+          :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'"
+          v-html="announcementHtml"
+        ></div>
         <div v-if="announcementModal.url" class="mt-4 text-sm">
           <a class="meow-btn-ghost inline-flex items-center gap-2" :href="announcementModal.url" target="_blank" rel="noreferrer">
             前往查看
           </a>
+        </div>
+        <div class="mt-4 flex items-center gap-2 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+          <label class="meow-pill motion-press">
+            <input v-model="announcementSuppress" type="checkbox" class="mr-2" />
+            不再弹出，直到有新公告
+          </label>
         </div>
         <div class="mt-5 flex justify-end">
           <button class="meow-btn-primary motion-press" type="button" @click="closeAnnouncementModal">
@@ -1582,6 +1665,27 @@ watch(isMobile, () => {
               >
                 加入 @Meowhuan_little_nest
               </a>
+            </div>
+            <div class="mt-4 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">最新公告</div>
+            <div v-if="!notifications.length" class="mt-2 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+              暂无公告
+            </div>
+            <div v-for="item in [...notifications].reverse()" :key="item.id" class="meow-window-item mt-2">
+              <div class="meow-window-time">{{ formatTime(item.createdAt) }}</div>
+              <div>
+                <div class="meow-window-titleline">
+                  <span>{{ item.title }}</span>
+                  <span class="meow-pill">{{ item.type }}</span>
+                </div>
+                <div class="meow-window-meta">
+                  {{ item.message }}
+                </div>
+                <div class="mt-2 flex items-center gap-2 text-[11px]">
+                  <button v-if="item.type === 'announcement'" class="copy-btn" type="button" @click="openAnnouncement(item, true)">
+                    查看公告
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
           <div v-else-if="overlayTab === 'rank'" class="info-panel compact-list">
@@ -1797,6 +1901,27 @@ watch(isMobile, () => {
         >
           加入 @Meowhuan_little_nest
         </a>
+      </div>
+      <div class="mt-4 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">最新公告</div>
+      <div v-if="!notifications.length" class="mt-2 text-xs" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+        暂无公告
+      </div>
+      <div v-for="item in [...notifications].reverse()" :key="`m-${item.id}`" class="meow-window-item mt-2">
+        <div class="meow-window-time">{{ formatTime(item.createdAt) }}</div>
+        <div>
+          <div class="meow-window-titleline">
+            <span>{{ item.title }}</span>
+            <span class="meow-pill">{{ item.type }}</span>
+          </div>
+          <div class="meow-window-meta">
+            {{ item.message }}
+          </div>
+          <div class="mt-2 flex items-center gap-2 text-[11px]">
+            <button v-if="item.type === 'announcement'" class="copy-btn" type="button" @click="openAnnouncement(item, true)">
+              查看公告
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   </div>

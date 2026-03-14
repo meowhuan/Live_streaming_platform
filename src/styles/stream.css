@@ -1736,6 +1736,63 @@
   border-color: rgba(120, 136, 200, 0.45);
 }
 
+.markdown-content {
+  line-height: 1.6;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3 {
+  font-weight: 700;
+  margin: 0.5em 0 0.4em;
+}
+
+.markdown-content h1 {
+  font-size: 1.1rem;
+}
+
+.markdown-content h2 {
+  font-size: 1.02rem;
+}
+
+.markdown-content h3 {
+  font-size: 0.98rem;
+}
+
+.markdown-content ul {
+  margin: 0.4em 0 0.6em;
+  padding-left: 1.2em;
+  list-style: disc;
+}
+
+.markdown-content li {
+  margin: 0.2em 0;
+}
+
+.markdown-content code {
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(233, 217, 234, 0.8);
+  padding: 2px 6px;
+  border-radius: 8px;
+  font-size: 0.85em;
+}
+
+.app-night .markdown-content code {
+  background: rgba(24, 26, 44, 0.7);
+  border-color: rgba(120, 136, 200, 0.35);
+}
+
+.markdown-content a {
+  color: #d2507a;
+  text-decoration: underline;
+}
+
+.app-night .markdown-content a {
+  color: #7fffd4;
+}
+
 .auth-tabs .auth-tab-active {
   background: rgba(246, 122, 166, 0.18);
   border-color: rgba(246, 122, 166, 0.6);
