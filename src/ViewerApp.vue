@@ -27,6 +27,12 @@ const opsAlerts = ref([]);
 const notifications = ref([]);
 const viewerSubscriptions = ref({ live: false, schedule: false, email: false });
 const notifyBanner = ref("");
+const announcementModal = ref(null);
+const showAnnouncementModal = ref(false);
+const closeAnnouncementModal = () => {
+  showAnnouncementModal.value = false;
+  announcementModal.value = null;
+};
 
 const chatMessages = ref([]);
 const loadStoredToken = (tokenKey, expiresKey, identityKey) => {
@@ -330,6 +336,26 @@ const fetchJson = async (url) => {
   return res.json();
 };
 
+let countdownRefreshing = false;
+let countdownRefreshAt = 0;
+const refreshCountdown = async () => {
+  if (countdownRefreshing) return;
+  countdownRefreshing = true;
+  try {
+    const countdownRes = await fetchJson("/api/live/countdown");
+    if (countdownRes) {
+      countdown.value = {
+        next: countdownRes.next || null,
+        remainingSecs: countdownRes.remainingSecs || 0
+      };
+    }
+  } catch {
+    // ignore countdown refresh errors
+  } finally {
+    countdownRefreshing = false;
+  }
+};
+
 const loadAll = async () => {
   loading.value = true;
   error.value = "";
@@ -445,6 +471,10 @@ const applyUpdate = (type, data) => {
           notifyBanner.value = "";
         }, 3000);
       }
+      if (data?.type === "announcement") {
+        announcementModal.value = data;
+        showAnnouncementModal.value = true;
+      }
       break;
     default:
       break;
@@ -500,6 +530,12 @@ const startCountdownTimer = () => {
         ...countdown.value,
         remainingSecs: Math.max(0, countdown.value.remainingSecs - 1)
       };
+    } else {
+      const now = Date.now();
+      if (now - countdownRefreshAt > 5000) {
+        countdownRefreshAt = now;
+        refreshCountdown();
+      }
     }
   }, 1000);
 };
@@ -1397,6 +1433,32 @@ watch(isMobile, () => {
     </header>
     <div v-if="notifyBanner" class="notify-banner">
       {{ notifyBanner }}
+    </div>
+    <div v-if="showAnnouncementModal && announcementModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+      <div class="meow-card motion-card w-full max-w-lg p-6" :class="isNight ? 'bg-meow-night-card/90 border-meow-night-line' : ''">
+        <div class="flex items-start justify-between gap-4">
+          <div>
+            <div class="text-xs uppercase tracking-widest" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">公告</div>
+            <h3 class="font-display text-2xl mt-1">{{ announcementModal.title }}</h3>
+          </div>
+          <button class="meow-pill motion-press text-[11px]" type="button" @click="closeAnnouncementModal">
+            关闭
+          </button>
+        </div>
+        <p class="mt-4 text-sm leading-relaxed" :class="isNight ? 'text-meow-night-soft' : 'text-meow-soft'">
+          {{ announcementModal.message }}
+        </p>
+        <div v-if="announcementModal.url" class="mt-4 text-sm">
+          <a class="meow-btn-ghost inline-flex items-center gap-2" :href="announcementModal.url" target="_blank" rel="noreferrer">
+            前往查看
+          </a>
+        </div>
+        <div class="mt-5 flex justify-end">
+          <button class="meow-btn-primary motion-press" type="button" @click="closeAnnouncementModal">
+            我知道了
+          </button>
+        </div>
+      </div>
     </div>
 
     <div class="app-main" :style="{ '--sidebar-width': isCollapsed ? '60px' : '280px' }">

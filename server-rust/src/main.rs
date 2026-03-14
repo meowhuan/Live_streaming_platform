@@ -503,6 +503,7 @@ async fn main() {
         .route("/api/mediamtx/auth", post(mediamtx_auth))
         .route("/api/mediamtx/metrics", get(get_mediamtx_metrics))
         .route("/api/notifications", get(get_notifications))
+        .route("/api/admin/notifications/push", post(admin_notification_push))
         .route("/api/admin/access-mode", get(admin_access_mode))
         .route("/api/admin/login", post(admin_login))
         .route("/api/admin/logout", post(admin_logout))
@@ -4482,6 +4483,15 @@ struct ViewerSubscriptionPayload {
     email: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct AdminNotificationPayload {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    title: String,
+    message: String,
+    url: Option<String>,
+}
+
 async fn push_notification(state: &AppState, kind: &str, title: &str, message: &str) {
     let mut items = get_json(&state.pool, "notifications", json!([])).await;
     if !items.is_array() {
@@ -4610,6 +4620,47 @@ async fn push_notification(state: &AppState, kind: &str, title: &str, message: &
             }
         }
     });
+}
+
+async fn admin_notification_push(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<AdminNotificationPayload>,
+) -> impl IntoResponse {
+    if !check_admin_auth(&headers, &state).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+    }
+    let title = payload.title.trim();
+    let message = payload.message.trim();
+    if title.is_empty() || message.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "missing_fields" })));
+    }
+    let kind = payload.kind.unwrap_or_else(|| "announcement".to_string());
+    let url = payload.url.unwrap_or_default();
+
+    let mut items = get_json(&state.pool, "notifications", json!([])).await;
+    if !items.is_array() {
+        items = json!([]);
+    }
+    let list = items.as_array_mut().unwrap();
+    list.push(json!({
+        "id": now_ts(),
+        "type": kind,
+        "title": title,
+        "message": message,
+        "url": url,
+        "createdAt": now_iso()
+    }));
+    if list.len() > 50 {
+        let overflow = list.len() - 50;
+        list.drain(0..overflow);
+    }
+    let last = list.last().cloned();
+    set_json(&state.pool, "notifications", &items).await;
+    if let Some(last) = last {
+        broadcast(&state, "notify:new", &last);
+    }
+    (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
 async fn viewer_subscription_get(
