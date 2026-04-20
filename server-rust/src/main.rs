@@ -1,42 +1,40 @@
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use axum::http::header::SET_COOKIE;
 use axum::{
+    Json, Router,
     extract::{
-        ws::{Message as WsMessage, WebSocket},
         State, WebSocketUpgrade,
+        ws::{Message as WsMessage, WebSocket},
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
-use axum::http::header::SET_COOKIE;
-use dotenvy::dotenv;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use futures::{SinkExt, StreamExt};
-use srt_tokio::SrtSocket;
-use sqlx::{mysql::MySqlPoolOptions, MySqlPool};
-use reqwest::Client;
-use sha2::{Digest, Sha256};
-use lettre::{
-    AsyncSmtpTransport, AsyncTransport, Message as MailMessage,
-    message::header::ContentType,
-    transport::smtp::authentication::Credentials,
-    Tokio1Executor,
-};
-use std::net::IpAddr;
-use tokio::sync::broadcast;
-use tokio::sync::RwLock;
-use tokio::process::Command;
-use tokio::fs;
-use tower_http::services::ServeDir;
 use chrono::TimeZone;
+use dotenvy::dotenv;
+use futures::{SinkExt, StreamExt};
+use lettre::{
+    AsyncSmtpTransport, AsyncTransport, Message as MailMessage, Tokio1Executor,
+    message::header::ContentType, transport::smtp::authentication::Credentials,
+};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use sqlx::{MySqlPool, mysql::MySqlPoolOptions};
+use srt_tokio::SrtSocket;
+use std::net::IpAddr;
+use tokio::fs;
+use tokio::process::Command;
+use tokio::sync::RwLock;
+use tokio::sync::broadcast;
+use tower_http::services::ServeDir;
 use tracing::info;
 use tracing_subscriber::fmt::Subscriber;
 
@@ -79,7 +77,9 @@ struct AppState {
     hls_segment_count: u64,
     clip_min_secs: u64,
     clip_max_secs: u64,
-    clip_dir: String,
+    clip_dir: PathBuf,
+    clip_tmp_dir: PathBuf,
+    live_dir: PathBuf,
     clip_ttl: Duration,
     ffmpeg_bin: String,
     thumbnail_interval: Duration,
@@ -130,7 +130,6 @@ struct RegisterTokenPayload {
     #[serde(rename = "turnstileToken")]
     turnstile_token: Option<String>,
 }
-
 
 #[derive(Deserialize)]
 struct RegisterVerifyPayload {
@@ -344,41 +343,65 @@ async fn main() {
     Subscriber::builder().with_target(false).init();
 
     let port = env_u16("PORT", 5174);
+    let bind_host = std::env::var("BIND_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let admin_user = std::env::var("ADMIN_USER").unwrap_or_else(|_| "admin".to_string());
     let admin_pass = std::env::var("ADMIN_PASS").unwrap_or_else(|_| "admin123".to_string());
     let token_ttl = Duration::from_secs(env_u64("TOKEN_TTL_HOURS", 12) * 3600);
     let ws_path = std::env::var("WS_PATH").unwrap_or_else(|_| "/ws".to_string());
+    let srt_enabled = env_bool("SRT_ENABLED", true);
     let srt_listen = std::env::var("SRT_LISTEN").unwrap_or_else(|_| "0.0.0.0:9000".to_string());
-    let srt_forward = std::env::var("SRT_FORWARD").ok().filter(|val| !val.trim().is_empty());
-    let mediamtx_api = std::env::var("MEDIAMTX_API").unwrap_or_else(|_| "http://127.0.0.1:9997".to_string());
-    let mediamtx_metrics = std::env::var("MEDIAMTX_METRICS").unwrap_or_else(|_| "http://127.0.0.1:9998".to_string());
-    let mediamtx_path = std::env::var("MEDIAMTX_PATH").unwrap_or_else(|_| "live/stream".to_string());
-    let mediamtx_webrtc = std::env::var("MEDIAMTX_WEBRTC").unwrap_or_else(|_| "http://127.0.0.1:8889".to_string());
-    let mediamtx_hls = std::env::var("MEDIAMTX_HLS").unwrap_or_else(|_| "http://127.0.0.1:8888".to_string());
-    let mediamtx_rtsp = std::env::var("MEDIAMTX_RTSP").unwrap_or_else(|_| "rtsp://127.0.0.1:8554".to_string());
-    let mediamtx_rtmp = std::env::var("MEDIAMTX_RTMP").unwrap_or_else(|_| "rtmp://127.0.0.1:1935".to_string());
+    let srt_forward = std::env::var("SRT_FORWARD")
+        .ok()
+        .filter(|val| !val.trim().is_empty());
+    let mediamtx_api =
+        std::env::var("MEDIAMTX_API").unwrap_or_else(|_| "http://127.0.0.1:9997".to_string());
+    let mediamtx_metrics =
+        std::env::var("MEDIAMTX_METRICS").unwrap_or_else(|_| "http://127.0.0.1:9998".to_string());
+    let mediamtx_path =
+        std::env::var("MEDIAMTX_PATH").unwrap_or_else(|_| "live/stream".to_string());
+    let mediamtx_webrtc =
+        std::env::var("MEDIAMTX_WEBRTC").unwrap_or_else(|_| "http://127.0.0.1:8889".to_string());
+    let mediamtx_hls =
+        std::env::var("MEDIAMTX_HLS").unwrap_or_else(|_| "http://127.0.0.1:8888".to_string());
+    let mediamtx_rtsp =
+        std::env::var("MEDIAMTX_RTSP").unwrap_or_else(|_| "rtsp://127.0.0.1:8554".to_string());
+    let mediamtx_rtmp =
+        std::env::var("MEDIAMTX_RTMP").unwrap_or_else(|_| "rtmp://127.0.0.1:1935".to_string());
     let mediamtx_poll = env_u64("MEDIAMTX_POLL_MS", 2000);
     let hls_segment_duration_secs = env_u64("HLS_SEGMENT_DURATION_SECS", 2);
     let hls_segment_count = env_u64("HLS_SEGMENT_COUNT", 60);
     let replay_max_seconds = env_u64("REPLAY_MAX_SECONDS", 120);
     let clip_min_secs = env_u64("CLIP_MIN_SECS", 15);
     let clip_max_secs = env_u64("CLIP_MAX_SECS", 30);
-    let clip_dir = std::env::var("CLIP_DIR").unwrap_or_else(|_| "public/clips".to_string());
+    let clip_dir = env_path("CLIP_DIR", "public/clips");
+    let clip_tmp_dir = env_path_with_default("CLIP_TMP_DIR", || {
+        std::env::temp_dir().join("meow-live-clip-tmp")
+    });
+    let live_dir = env_path("LIVE_DIR", "public/live");
     let clip_ttl = Duration::from_secs(env_u64("CLIP_TTL_SECS", 3600));
     let ffmpeg_bin = std::env::var("FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string());
+    let thumbnail_enabled = env_bool("THUMBNAIL_ENABLED", true);
     let thumbnail_interval = Duration::from_secs(env_u64("THUMBNAIL_INTERVAL_SECS", 30).max(10));
-    let thumbnail_source = std::env::var("THUMBNAIL_SOURCE").ok().filter(|v| !v.trim().is_empty());
+    let thumbnail_source = std::env::var("THUMBNAIL_SOURCE")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let email_code_ttl = Duration::from_secs(env_u64("EMAIL_CODE_TTL_MIN", 10) * 60);
     let email_echo = std::env::var("EMAIL_ECHO")
         .map(|val| val.to_lowercase() != "false")
         .unwrap_or(true);
     let public_base_url = std::env::var("PUBLIC_BASE_URL").unwrap_or_default();
-    let public_ip = std::env::var("PUBLIC_IP").ok().filter(|v| !v.trim().is_empty());
-    let turnstile_secret = std::env::var("TURNSTILE_SECRET").ok().filter(|val| !val.trim().is_empty());
+    let public_ip = std::env::var("PUBLIC_IP")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let turnstile_secret = std::env::var("TURNSTILE_SECRET")
+        .ok()
+        .filter(|val| !val.trim().is_empty());
     let cf_access_required = std::env::var("CF_ACCESS_REQUIRED")
         .map(|val| val.to_lowercase() == "true" || val == "1")
         .unwrap_or(false);
-    let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|v| !v.trim().is_empty());
+    let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let chat_filter_words = std::env::var("CHAT_FILTER_WORDS")
         .ok()
         .unwrap_or_default()
@@ -398,6 +421,8 @@ async fn main() {
     let smtp = load_smtp_config_db(&pool).await.or_else(load_smtp_config);
 
     let (tx, _rx) = broadcast::channel::<String>(64);
+    let clip_serve_dir = clip_dir.clone();
+    let live_serve_dir = live_dir.clone();
     let state = AppState {
         pool,
         admin_user,
@@ -446,6 +471,8 @@ async fn main() {
         clip_min_secs,
         clip_max_secs,
         clip_dir,
+        clip_tmp_dir,
+        live_dir,
         clip_ttl,
         ffmpeg_bin,
         thumbnail_interval,
@@ -476,8 +503,8 @@ async fn main() {
     }
 
     let router = Router::new()
-        .nest_service("/clips", ServeDir::new("public/clips"))
-        .nest_service("/live", ServeDir::new("public/live"))
+        .nest_service("/clips", ServeDir::new(clip_serve_dir))
+        .nest_service("/live", ServeDir::new(live_serve_dir))
         .route("/api/stream", get(get_stream))
         .route("/api/stream/status", get(get_stream_status))
         .route("/api/stream/stats", get(get_stats))
@@ -503,7 +530,10 @@ async fn main() {
         .route("/api/mediamtx/auth", post(mediamtx_auth))
         .route("/api/mediamtx/metrics", get(get_mediamtx_metrics))
         .route("/api/notifications", get(get_notifications))
-        .route("/api/admin/notifications/push", post(admin_notification_push))
+        .route(
+            "/api/admin/notifications/push",
+            post(admin_notification_push),
+        )
         .route("/api/admin/access-mode", get(admin_access_mode))
         .route("/api/admin/login", post(admin_login))
         .route("/api/admin/logout", post(admin_logout))
@@ -514,10 +544,22 @@ async fn main() {
         .route("/api/admin/smtp/test", post(admin_smtp_test))
         .route("/api/admin/telegram/channel", get(admin_telegram_get))
         .route("/api/admin/telegram/channel", post(admin_telegram_set))
-        .route("/api/admin/notify-templates", get(admin_notify_templates_get))
-        .route("/api/admin/notify-templates", post(admin_notify_templates_set))
-        .route("/api/admin/viewer-anti-abuse", get(admin_viewer_anti_abuse_get))
-        .route("/api/admin/viewer-anti-abuse", post(admin_viewer_anti_abuse_set))
+        .route(
+            "/api/admin/notify-templates",
+            get(admin_notify_templates_get),
+        )
+        .route(
+            "/api/admin/notify-templates",
+            post(admin_notify_templates_set),
+        )
+        .route(
+            "/api/admin/viewer-anti-abuse",
+            get(admin_viewer_anti_abuse_get),
+        )
+        .route(
+            "/api/admin/viewer-anti-abuse",
+            post(admin_viewer_anti_abuse_set),
+        )
         .route("/api/viewer/login", post(viewer_login))
         .route("/api/viewer/logout", post(viewer_logout))
         .route("/api/viewer/subscribe", get(viewer_subscription_get))
@@ -543,35 +585,49 @@ async fn main() {
 
     cleanup_duplicate_viewers(&state).await;
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = parse_bind_addr(&bind_host, port);
     info!("Rust backend running at http://localhost:{port}");
+    info!("Rust backend listening on {addr}");
     info!("WebSocket server at ws://localhost:{port}{ws_path}");
     let state_for_srt = Arc::new(state);
-    let srt_state = state_for_srt.clone();
-    tokio::spawn(async move {
-        if let Err(err) = run_srt_listener(&srt_state, &srt_listen, srt_forward.as_deref()).await {
-            info!("SRT listener stopped: {err}");
-        }
-    });
+    if srt_enabled {
+        let srt_state = state_for_srt.clone();
+        tokio::spawn(async move {
+            if let Err(err) =
+                run_srt_listener(&srt_state, &srt_listen, srt_forward.as_deref()).await
+            {
+                info!("SRT listener stopped: {err}");
+            }
+        });
+    } else {
+        info!("SRT listener disabled");
+    }
 
     let api_state = state_for_srt.clone();
     tokio::spawn(async move {
         run_mediamtx_poll(api_state, mediamtx_poll).await;
     });
 
-    let thumb_state = state_for_srt.clone();
-    tokio::spawn(async move {
-        run_thumbnail_loop(thumb_state).await;
-    });
+    if thumbnail_enabled {
+        let thumb_state = state_for_srt.clone();
+        tokio::spawn(async move {
+            run_thumbnail_loop(thumb_state).await;
+        });
+    } else {
+        info!("thumbnail loop disabled");
+    }
 
     let clip_state = state_for_srt.clone();
     tokio::spawn(async move {
         run_clip_cleanup_loop(clip_state).await;
     });
 
-    axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), router.with_state(state_for_srt))
-        .await
-        .unwrap();
+    axum::serve(
+        tokio::net::TcpListener::bind(addr).await.unwrap(),
+        router.with_state(state_for_srt),
+    )
+    .await
+    .unwrap();
 }
 
 async fn create_pool() -> MySqlPool {
@@ -712,11 +768,12 @@ async fn ensure_tables(pool: &MySqlPool) {
 
 async fn ensure_defaults(pool: &MySqlPool) {
     for (key, value) in default_kv() {
-        let existing: Option<String> = sqlx::query_scalar("SELECT v FROM kv_store WHERE k = ? LIMIT 1")
-            .bind(&key)
-            .fetch_optional(pool)
-            .await
-            .expect("select default failed");
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT v FROM kv_store WHERE k = ? LIMIT 1")
+                .bind(&key)
+                .fetch_optional(pool)
+                .await
+                .expect("select default failed");
         if existing.is_none() {
             set_json(pool, &key, &value).await;
         }
@@ -758,7 +815,7 @@ async fn backfill_chat_user_ids(pool: &MySqlPool) {
         JOIN viewer_users vu ON LOWER(cm.user) = LOWER(vu.username)
         SET cm.user_id = vu.id
         WHERE cm.user_id IS NULL
-        "#
+        "#,
     )
     .execute(pool)
     .await;
@@ -779,14 +836,12 @@ async fn get_json(pool: &MySqlPool, key: &str, fallback: Value) -> Value {
 
 async fn set_json(pool: &MySqlPool, key: &str, value: &Value) {
     let payload = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
-    sqlx::query(
-        "INSERT INTO kv_store (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)",
-    )
-    .bind(key)
-    .bind(payload)
-    .execute(pool)
-    .await
-    .expect("insert failed");
+    sqlx::query("INSERT INTO kv_store (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)")
+        .bind(key)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .expect("insert failed");
 }
 
 fn default_kv() -> Vec<(String, Value)> {
@@ -978,11 +1033,7 @@ fn chat_heat(count_10s: i64) -> &'static str {
 
 fn replace_chat_emojis(input: &str) -> String {
     let mut out = input.to_string();
-    let replacements = [
-        (":cat:", "🐱"),
-        (":awawa:", "🥺"),
-        (":thonk:", "🤔"),
-    ];
+    let replacements = [(":cat:", "🐱"), (":awawa:", "🥺"), (":thonk:", "🤔")];
     for (key, value) in replacements {
         out = out.replace(key, value);
     }
@@ -1083,6 +1134,46 @@ fn env_bool(key: &str, fallback: bool) -> bool {
         .unwrap_or(fallback)
 }
 
+fn env_path(key: &str, fallback: &str) -> PathBuf {
+    env_path_with_default(key, || PathBuf::from(fallback))
+}
+
+fn env_path_with_default<F>(key: &str, fallback: F) -> PathBuf
+where
+    F: FnOnce() -> PathBuf,
+{
+    std::env::var(key)
+        .ok()
+        .map(|val| val.trim().to_string())
+        .filter(|val| !val.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(fallback)
+}
+
+fn resolve_runtime_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn parse_bind_addr(host: &str, port: u16) -> SocketAddr {
+    let host = host.trim();
+    let candidate = if host.starts_with('[') && host.ends_with(']') {
+        format!("{host}:{port}")
+    } else if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    candidate
+        .parse::<SocketAddr>()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)))
+}
+
 fn normalize_remember_days(days: Option<u64>) -> Option<u64> {
     match days {
         Some(7) => Some(7),
@@ -1110,8 +1201,7 @@ impl ViewerAntiAbuseConfig {
             env_i64("VIEWER_VERIFY_EMAIL_COOLDOWN_SEC", 600).clamp(60, 7200);
         let block_disposable_email = env_bool("VIEWER_BLOCK_DISPOSABLE_EMAIL", true);
         let block_edu_gov_email = env_bool("VIEWER_BLOCK_EDU_GOV_EMAIL", true);
-        let register_token_ttl_secs =
-            env_i64("VIEWER_REGISTER_TOKEN_TTL_SEC", 600).clamp(60, 3600);
+        let register_token_ttl_secs = env_i64("VIEWER_REGISTER_TOKEN_TTL_SEC", 600).clamp(60, 3600);
 
         Self {
             verify_email_rate_limit_window_secs,
@@ -1171,11 +1261,7 @@ async fn resolve_viewer_anti_abuse_config(
 }
 
 fn client_ip(headers: &HeaderMap) -> Option<String> {
-    let candidates = [
-        "cf-connecting-ip",
-        "x-forwarded-for",
-        "x-real-ip",
-    ];
+    let candidates = ["cf-connecting-ip", "x-forwarded-for", "x-real-ip"];
     for key in candidates {
         if let Some(value) = headers.get(key) {
             if let Ok(raw) = value.to_str() {
@@ -1189,10 +1275,7 @@ fn client_ip(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-async fn run_mediamtx_poll(
-    state: Arc<AppState>,
-    interval_ms: u64,
-) {
+async fn run_mediamtx_poll(state: Arc<AppState>, interval_ms: u64) {
     let client = Client::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(500)));
     loop {
@@ -1245,7 +1328,10 @@ async fn run_mediamtx_poll(
             );
             if let Some(latency) = metric_value_for_path(
                 &metrics,
-                &["mediamtx_path_source_latency_seconds", "mediamtx_path_source_latency"],
+                &[
+                    "mediamtx_path_source_latency_seconds",
+                    "mediamtx_path_source_latency",
+                ],
                 &state.mediamtx_path,
             ) {
                 push_latency = Some(format!("{:.2}s", latency));
@@ -1301,11 +1387,20 @@ async fn get_stream_ingest(State(state): State<Arc<AppState>>) -> impl IntoRespo
     let public_host = resolve_public_host(&state).await;
     let srt_url = format!(
         "srt://{}:8890?streamid=publish:{}:token:{}",
-        public_host,
-        state.mediamtx_path, publish
+        public_host, state.mediamtx_path, publish
     );
-    let rtmp_url = build_push_url(&state.mediamtx_rtmp, &public_host, &state.mediamtx_path, &publish);
-    let rtsp_url = build_push_url(&state.mediamtx_rtsp, &public_host, &state.mediamtx_path, &publish);
+    let rtmp_url = build_push_url(
+        &state.mediamtx_rtmp,
+        &public_host,
+        &state.mediamtx_path,
+        &publish,
+    );
+    let rtsp_url = build_push_url(
+        &state.mediamtx_rtsp,
+        &public_host,
+        &state.mediamtx_path,
+        &publish,
+    );
     Json(json!({
         "srt": srt_url,
         "rtmp": rtmp_url,
@@ -1343,7 +1438,10 @@ async fn get_stream_play(
     }))
 }
 
-async fn get_stream_replay(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+async fn get_stream_replay(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let read = ensure_read_token(&state).await;
     let hls_base = public_media_base(&state.mediamtx_hls, &headers);
     let hls = format!(
@@ -1352,8 +1450,8 @@ async fn get_stream_replay(State(state): State<Arc<AppState>>, headers: HeaderMa
         state.mediamtx_path,
         read
     );
-    let max_seconds = (state.hls_segment_duration_secs * state.hls_segment_count)
-        .min(state.replay_max_seconds);
+    let max_seconds =
+        (state.hls_segment_duration_secs * state.hls_segment_count).min(state.replay_max_seconds);
     Json(json!({
         "enabled": true,
         "maxSeconds": max_seconds,
@@ -1375,8 +1473,7 @@ fn public_media_base(base: &str, headers: &HeaderMap) -> String {
         .get("x-forwarded-host")
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.trim().is_empty());
-    let host_header = forwarded_host
-        .or_else(|| headers.get("host").and_then(|v| v.to_str().ok()));
+    let host_header = forwarded_host.or_else(|| headers.get("host").and_then(|v| v.to_str().ok()));
     let Some(host_header) = host_header else {
         return base.to_string();
     };
@@ -1511,7 +1608,11 @@ fn split_host_port(input: &str) -> (String, Option<String>) {
 }
 
 fn is_local_host(host: &str) -> bool {
-    let normalized = host.trim().trim_start_matches('[').trim_end_matches(']').to_lowercase();
+    let normalized = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_lowercase();
     matches!(
         normalized.as_str(),
         "127.0.0.1" | "localhost" | "::1" | "0.0.0.0"
@@ -1535,7 +1636,10 @@ async fn get_live_status(State(state): State<Arc<AppState>>) -> impl IntoRespons
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0)
         .round() as i64;
-    let resolution = stream.get("resolution").and_then(|v| v.as_str()).unwrap_or("-");
+    let resolution = stream
+        .get("resolution")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
     let fps = stream
         .get("fps")
         .and_then(|v| v.as_str())
@@ -1553,7 +1657,10 @@ async fn get_live_status(State(state): State<Arc<AppState>>) -> impl IntoRespons
         "publish": read_latency_ms(&stream, "publishLatencyMs", "pushLatency"),
         "playback": read_latency_ms(&stream, "playbackLatencyMs", "playoutDelay"),
     });
-    let started_at = stream.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    let started_at = stream
+        .get("startedAt")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     Json(json!({
         "live": live,
         "title": stream.get("title").and_then(|v| v.as_str()).unwrap_or(""),
@@ -1573,7 +1680,10 @@ async fn get_live_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .and_then(|v| v.as_str())
         .unwrap_or("offline");
     let live = matches!(status, "live" | "ready");
-    let started_at = stream.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    let started_at = stream
+        .get("startedAt")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let latency = json!({
         "end_to_end": read_latency_ms(&stream, "latencyE2eMs", "latency"),
         "publish": read_latency_ms(&stream, "publishLatencyMs", "pushLatency"),
@@ -1729,7 +1839,7 @@ async fn get_chat_latest(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 async fn get_chat_activity(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let count_10s = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM chat_messages WHERE created_at >= (NOW() - INTERVAL 10 SECOND)"
+        "SELECT COUNT(*) FROM chat_messages WHERE created_at >= (NOW() - INTERVAL 10 SECOND)",
     )
     .fetch_one(&state.pool)
     .await
@@ -1747,7 +1857,10 @@ async fn get_chat_leaderboard(
 ) -> impl IntoResponse {
     let limit = query.limit.unwrap_or(10).min(100);
     let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
-    let mut started_at = stream.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    let mut started_at = stream
+        .get("startedAt")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     if started_at <= 0 {
         started_at = now_ts() - state.live_count_fallback_secs as i64;
     }
@@ -1798,7 +1911,10 @@ async fn post_chat_send(
     }
 
     let Some((_token, viewer, user_id)) = viewer_session_from_header(&headers, &state).await else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "login_required" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "login_required" })),
+        );
     };
     let user = viewer;
 
@@ -1808,40 +1924,44 @@ async fn post_chat_send(
     let text = text.chars().take(200).collect::<String>();
     if !state.chat_filter_words.is_empty() {
         let lowered = text.to_lowercase();
-        if state.chat_filter_words.iter().any(|word| lowered.contains(word)) {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "含有敏感词" })));
+        if state
+            .chat_filter_words
+            .iter()
+            .any(|word| lowered.contains(word))
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "含有敏感词" })),
+            );
         }
     }
 
-    let result = sqlx::query(
-        "INSERT INTO chat_messages (user, user_id, text) VALUES (?, ?, ?)"
-    )
-    .bind(&user)
-    .bind(user_id)
-    .bind(&text)
-    .execute(&state.pool)
-    .await;
+    let result = sqlx::query("INSERT INTO chat_messages (user, user_id, text) VALUES (?, ?, ?)")
+        .bind(&user)
+        .bind(user_id)
+        .bind(&text)
+        .execute(&state.pool)
+        .await;
 
     if result.is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "db" })));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "db" })),
+        );
     }
 
     let msg_count = if let Some(uid) = user_id {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM chat_messages WHERE user_id = ?"
-        )
-        .bind(uid)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0)
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chat_messages WHERE user_id = ?")
+            .bind(uid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(0)
     } else {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM chat_messages WHERE user = ?"
-        )
-        .bind(&user)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0)
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chat_messages WHERE user = ?")
+            .bind(&user)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(0)
     };
     let level = chat_level(msg_count);
     let msg = ChatMessage {
@@ -1857,20 +1977,24 @@ async fn post_chat_send(
     broadcast(&state, "chat:new", &json!(msg));
 
     if let Ok(count_10s) = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM chat_messages WHERE created_at >= (NOW() - INTERVAL 10 SECOND)"
+        "SELECT COUNT(*) FROM chat_messages WHERE created_at >= (NOW() - INTERVAL 10 SECOND)",
     )
     .fetch_one(&state.pool)
     .await
     {
         let heat = chat_heat(count_10s);
-        broadcast(&state, "chat:activity", &json!({
-            "per10s": count_10s,
-            "heat": heat
-        }));
+        broadcast(
+            &state,
+            "chat:activity",
+            &json!({
+                "per10s": count_10s,
+                "heat": heat
+            }),
+        );
     }
 
     if let Ok(count) = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM chat_messages WHERE created_at >= (NOW() - INTERVAL 60 SECOND)"
+        "SELECT COUNT(*) FROM chat_messages WHERE created_at >= (NOW() - INTERVAL 60 SECOND)",
     )
     .fetch_one(&state.pool)
     .await
@@ -1888,19 +2012,30 @@ async fn post_clip_create(
     Json(payload): Json<ClipCreatePayload>,
 ) -> impl IntoResponse {
     let Some(viewer) = viewer_from_header(&headers, &state).await else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "login_required" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "login_required" })),
+        );
     };
     let length_secs = payload.length_secs.unwrap_or(20);
     if length_secs < state.clip_min_secs || length_secs > state.clip_max_secs {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "length_invalid", "min": state.clip_min_secs, "max": state.clip_max_secs })),
+            Json(
+                json!({ "error": "length_invalid", "min": state.clip_min_secs, "max": state.clip_max_secs }),
+            ),
         );
     }
     let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
-    let status = stream.get("status").and_then(|v| v.as_str()).unwrap_or("offline");
+    let status = stream
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("offline");
     if status != "live" && status != "ready" {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "stream_offline" })));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "stream_offline" })),
+        );
     }
 
     let clip_id = format!("clip_{:x}", rand_u64());
@@ -1922,13 +2057,19 @@ async fn post_clip_create(
     .await;
 
     if insert.is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "db" })));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "db" })),
+        );
     }
 
     let task_state = state.clone();
     let clip_id_task = clip_id.clone();
     tokio::spawn(async move {
-        info!("clip build started id={} length_secs={}", clip_id_task, length_secs);
+        info!(
+            "clip build started id={} length_secs={}",
+            clip_id_task, length_secs
+        );
         let result = build_clip_from_hls(&task_state, &clip_id_task, length_secs).await;
         if let Err(err) = result {
             info!("clip build failed id={} error={}", clip_id_task, err);
@@ -1995,7 +2136,11 @@ async fn post_stream_telemetry(
     (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
-async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: u64) -> Result<(), String> {
+async fn build_clip_from_hls(
+    state: &Arc<AppState>,
+    clip_id: &str,
+    length_secs: u64,
+) -> Result<(), String> {
     let read = ensure_read_token(state).await;
     let playlist_url = format!(
         "{}/{}/index.m3u8?token={}",
@@ -2015,7 +2160,14 @@ async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: 
         }
         let selected = select_hls_segments(&variant_info.segments, length_secs as f64);
         let segment_count = selected.len().max(1);
-        return build_clip_with_ffmpeg_hls(state, clip_id, &playlist_url, length_secs, segment_count).await;
+        return build_clip_with_ffmpeg_hls(
+            state,
+            clip_id,
+            &playlist_url,
+            length_secs,
+            segment_count,
+        )
+        .await;
     }
 
     let playlist_info = parse_hls_playlist(&playlist, &playlist_url, &read);
@@ -2027,7 +2179,7 @@ async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: 
         return Err("segment_select_failed".to_string());
     }
 
-    let tmp_root = PathBuf::from("resources/clip_tmp").join(clip_id);
+    let tmp_root = resolve_runtime_path(&state.clip_tmp_dir).join(clip_id);
     fs::create_dir_all(&tmp_root)
         .await
         .map_err(|_| "tmp_dir_failed".to_string())?;
@@ -2050,7 +2202,10 @@ async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: 
             .map_err(|_| "init_write_failed".to_string())?;
         let line = format!(
             "file '{}'",
-            base_dir.join(&init_path).to_string_lossy().replace('\\', "/")
+            base_dir
+                .join(&init_path)
+                .to_string_lossy()
+                .replace('\\', "/")
         );
         list_lines.push(line);
     }
@@ -2079,7 +2234,7 @@ async fn build_clip_from_hls(state: &Arc<AppState>, clip_id: &str, length_secs: 
         .await
         .map_err(|_| "concat_write_failed".to_string())?;
 
-    let output_dir = PathBuf::from(&state.clip_dir);
+    let output_dir = resolve_runtime_path(&state.clip_dir);
     fs::create_dir_all(&output_dir)
         .await
         .map_err(|_| "clip_dir_failed".to_string())?;
@@ -2158,7 +2313,11 @@ fn parse_hls_playlist(playlist: &str, playlist_url: &str, token: &str) -> HlsPla
         }
         if trimmed.starts_with("#EXTINF:") {
             let value = trimmed.trim_start_matches("#EXTINF:");
-            let duration = value.split(',').next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+            let duration = value
+                .split(',')
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
             current_duration = Some(duration);
             continue;
         }
@@ -2225,7 +2384,9 @@ fn append_token(url: &str, token: &str) -> String {
 }
 
 fn is_master_playlist(playlist: &str) -> bool {
-    playlist.lines().any(|line| line.trim_start().starts_with("#EXT-X-STREAM-INF"))
+    playlist
+        .lines()
+        .any(|line| line.trim_start().starts_with("#EXT-X-STREAM-INF"))
 }
 
 fn select_hls_variant(playlist: &str, playlist_url: &str, token: &str) -> Option<String> {
@@ -2238,7 +2399,9 @@ fn select_hls_variant(playlist: &str, playlist_url: &str, token: &str) -> Option
         if trimmed.starts_with("#EXT-X-STREAM-INF:") {
             let bw = parse_hls_attr(trimmed, "BANDWIDTH")
                 .and_then(|v| v.parse::<u64>().ok())
-                .or_else(|| parse_hls_attr(trimmed, "AVERAGE-BANDWIDTH").and_then(|v| v.parse::<u64>().ok()))
+                .or_else(|| {
+                    parse_hls_attr(trimmed, "AVERAGE-BANDWIDTH").and_then(|v| v.parse::<u64>().ok())
+                })
                 .unwrap_or(0);
             pending_bandwidth = Some(bw);
             continue;
@@ -2281,7 +2444,9 @@ fn parse_hls_attr(line: &str, key: &str) -> Option<String> {
 
 fn file_extension_from_url(url: &str) -> Option<&str> {
     let clean = url.split('?').next().unwrap_or(url);
-    std::path::Path::new(clean).extension().and_then(|ext| ext.to_str())
+    std::path::Path::new(clean)
+        .extension()
+        .and_then(|ext| ext.to_str())
 }
 
 fn clip_filename_from_url(url: &str) -> Option<String> {
@@ -2312,12 +2477,7 @@ async fn build_clip_with_ffmpeg_hls(
     length_secs: u64,
     segment_count: usize,
 ) -> Result<(), String> {
-    let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let output_dir = if Path::new(&state.clip_dir).is_absolute() {
-        PathBuf::from(&state.clip_dir)
-    } else {
-        base_dir.join(&state.clip_dir)
-    };
+    let output_dir = resolve_runtime_path(&state.clip_dir);
     fs::create_dir_all(&output_dir)
         .await
         .map_err(|_| "clip_dir_failed".to_string())?;
@@ -2346,7 +2506,10 @@ async fn run_ffmpeg(bin: &str, args: &[String]) -> Result<(), String> {
     for arg in args {
         cmd.arg(arg);
     }
-    let status = cmd.status().await.map_err(|_| "ffmpeg_start_failed".to_string())?;
+    let status = cmd
+        .status()
+        .await
+        .map_err(|_| "ffmpeg_start_failed".to_string())?;
     if status.success() {
         Ok(())
     } else {
@@ -2371,7 +2534,10 @@ async fn run_thumbnail_loop(state: Arc<AppState>) {
     loop {
         ticker.tick().await;
         let stream = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
-        let status = stream.get("status").and_then(|v| v.as_str()).unwrap_or("offline");
+        let status = stream
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("offline");
         if status != "live" && status != "ready" {
             continue;
         }
@@ -2386,7 +2552,7 @@ async fn run_thumbnail_loop(state: Arc<AppState>) {
                 read
             )
         };
-        let output_dir = PathBuf::from("public/live");
+        let output_dir = resolve_runtime_path(&state.live_dir);
         if fs::create_dir_all(&output_dir).await.is_err() {
             continue;
         }
@@ -2426,24 +2592,18 @@ async fn cleanup_expired_clips(state: &Arc<AppState>) {
     if ttl_secs <= 0 {
         return;
     }
-    let expired: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, url FROM clips WHERE created_at < (NOW() - INTERVAL ? SECOND)"
-    )
-    .bind(ttl_secs)
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
+    let expired: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, url FROM clips WHERE created_at < (NOW() - INTERVAL ? SECOND)")
+            .bind(ttl_secs)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default();
 
     if expired.is_empty() {
         return;
     }
 
-    let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let clip_root = if Path::new(&state.clip_dir).is_absolute() {
-        PathBuf::from(&state.clip_dir)
-    } else {
-        base_dir.join(&state.clip_dir)
-    };
+    let clip_root = resolve_runtime_path(&state.clip_dir);
 
     for (clip_id, url) in expired {
         if let Some(filename) = clip_filename_from_url(&url) {
@@ -2463,12 +2623,7 @@ async fn mediamtx_auth(
 ) -> impl IntoResponse {
     info!(
         "mediamtx_auth action={} path={:?} token_field={:?} query={:?} user={:?} pass={:?}",
-        payload.action,
-        payload.path,
-        payload.token,
-        payload.query,
-        payload.user,
-        payload.password
+        payload.action, payload.path, payload.token, payload.query, payload.user, payload.password
     );
     let action = payload.action.as_str();
     let mut path = payload.path.unwrap_or_default();
@@ -2482,19 +2637,26 @@ async fn mediamtx_auth(
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "path" })));
     }
 
-    let token_from_query = payload
-        .query
-        .as_deref()
-        .and_then(|q| q.split('&').find_map(|kv| {
+    let token_from_query = payload.query.as_deref().and_then(|q| {
+        q.split('&').find_map(|kv| {
             let mut parts = kv.split('=');
             let key = parts.next()?;
             let value = parts.next()?;
-            if key == "token" { Some(value.to_string()) } else { None }
-        }));
+            if key == "token" {
+                Some(value.to_string())
+            } else {
+                None
+            }
+        })
+    });
     let clean_opt = |val: Option<String>| {
         val.and_then(|s| {
             let trimmed = s.trim().to_string();
-            if trimmed.is_empty() { None } else { Some(trimmed) }
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
         })
     };
     let user = clean_opt(payload.user.clone());
@@ -2538,12 +2700,18 @@ async fn get_mediamtx_metrics(State(state): State<Arc<AppState>>) -> impl IntoRe
     let client = Client::new();
     let url = format!("{}/metrics", state.mediamtx_metrics.trim_end_matches('/'));
     let resp = client.get(&url).send().await;
-    let Ok(resp) = resp else { return Json(json!({ "error": "fetch" })) };
-    let Ok(body) = resp.text().await else { return Json(json!({ "error": "read" })) };
+    let Ok(resp) = resp else {
+        return Json(json!({ "error": "fetch" }));
+    };
+    let Ok(body) = resp.text().await else {
+        return Json(json!({ "error": "read" }));
+    };
 
     let mut stats = json!({});
     for line in body.lines() {
-        if line.starts_with('#') { continue; }
+        if line.starts_with('#') {
+            continue;
+        }
         if line.contains("mediamtx_path_readers") || line.contains("mediamtx_path_bytes") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() == 2 {
@@ -2571,8 +2739,8 @@ fn metric_value_for_path(body: &str, names: &[&str], path: &str) -> Option<f64> 
             }
             let value = line.split_whitespace().last()?.parse::<f64>().ok()?;
             if let Some(labels) = extract_labels(line) {
-                if let Some(label_path) = label_value(&labels, "path")
-                    .or_else(|| label_value(&labels, "name"))
+                if let Some(label_path) =
+                    label_value(&labels, "path").or_else(|| label_value(&labels, "name"))
                 {
                     if label_path == path {
                         return Some(value);
@@ -2677,30 +2845,49 @@ async fn compute_health_rates_mbps(
 
 fn score_bitrate(mbps: Option<f64>) -> i64 {
     let Some(mbps) = mbps else { return 0 };
-    if mbps >= 8.0 { 100 }
-    else if mbps >= 5.0 { 85 }
-    else if mbps >= 2.0 { 70 }
-    else if mbps >= 1.0 { 50 }
-    else if mbps > 0.1 { 30 }
-    else { 10 }
+    if mbps >= 8.0 {
+        100
+    } else if mbps >= 5.0 {
+        85
+    } else if mbps >= 2.0 {
+        70
+    } else if mbps >= 1.0 {
+        50
+    } else if mbps > 0.1 {
+        30
+    } else {
+        10
+    }
 }
 
 fn score_latency(latency: Option<f64>) -> i64 {
     let Some(latency) = latency else { return 0 };
-    if latency <= 0.3 { 100 }
-    else if latency <= 0.8 { 85 }
-    else if latency <= 1.5 { 70 }
-    else if latency <= 3.0 { 50 }
-    else { 30 }
+    if latency <= 0.3 {
+        100
+    } else if latency <= 0.8 {
+        85
+    } else if latency <= 1.5 {
+        70
+    } else if latency <= 3.0 {
+        50
+    } else {
+        30
+    }
 }
 
 fn score_readers(readers: Option<f64>) -> i64 {
     let Some(readers) = readers else { return 0 };
-    if readers >= 100.0 { 100 }
-    else if readers >= 50.0 { 85 }
-    else if readers >= 10.0 { 70 }
-    else if readers >= 1.0 { 50 }
-    else { 20 }
+    if readers >= 100.0 {
+        100
+    } else if readers >= 50.0 {
+        85
+    } else if readers >= 10.0 {
+        70
+    } else if readers >= 1.0 {
+        50
+    } else {
+        20
+    }
 }
 
 async fn build_health_from_metrics(state: &Arc<AppState>) -> Option<Value> {
@@ -2724,19 +2911,26 @@ async fn build_health_from_metrics(state: &Arc<AppState>) -> Option<Value> {
     );
     let latency = metric_value_for_path(
         &body,
-        &["mediamtx_path_source_latency_seconds", "mediamtx_path_source_latency"],
+        &[
+            "mediamtx_path_source_latency_seconds",
+            "mediamtx_path_source_latency",
+        ],
         &state.mediamtx_path,
     );
-    let readers = metric_value_for_path(
-        &body,
-        &["mediamtx_path_readers"],
-        &state.mediamtx_path,
-    );
+    let readers = metric_value_for_path(&body, &["mediamtx_path_readers"], &state.mediamtx_path);
     let (rx_mbps, tx_mbps) = compute_health_rates_mbps(&state, rx_bytes, tx_bytes).await;
-    let rx_note = rx_mbps.map(|v| format!("{:.2} Mbps", v)).unwrap_or_else(|| "暂无".to_string());
-    let tx_note = tx_mbps.map(|v| format!("{:.2} Mbps", v)).unwrap_or_else(|| "暂无".to_string());
-    let latency_note = latency.map(|v| format!("{:.2}s", v)).unwrap_or_else(|| "暂无".to_string());
-    let readers_note = readers.map(|v| format!("{:.0} 观众", v)).unwrap_or_else(|| "暂无".to_string());
+    let rx_note = rx_mbps
+        .map(|v| format!("{:.2} Mbps", v))
+        .unwrap_or_else(|| "暂无".to_string());
+    let tx_note = tx_mbps
+        .map(|v| format!("{:.2} Mbps", v))
+        .unwrap_or_else(|| "暂无".to_string());
+    let latency_note = latency
+        .map(|v| format!("{:.2}s", v))
+        .unwrap_or_else(|| "暂无".to_string());
+    let readers_note = readers
+        .map(|v| format!("{:.0} 观众", v))
+        .unwrap_or_else(|| "暂无".to_string());
 
     Some(json!([
         { "label": "推流输入带宽", "value": score_bitrate(rx_mbps), "note": rx_note },
@@ -2752,7 +2946,11 @@ async fn admin_login(
     Json(payload): Json<LoginPayload>,
 ) -> impl IntoResponse {
     if !check_cf_access(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "access" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            Json(json!({ "error": "access" })),
+        );
     }
 
     let authed = if payload.username == state.admin_user && payload.password == state.admin_pass {
@@ -2768,7 +2966,11 @@ async fn admin_login(
         })
     };
     if !authed {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "invalid" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            Json(json!({ "error": "invalid" })),
+        );
     }
 
     let ttl = ttl_from_remember(state.token_ttl, payload.remember_days);
@@ -2776,10 +2978,23 @@ async fn admin_login(
     let mut tokens = state.tokens.write().await;
     tokens.insert(token.clone(), Instant::now() + ttl);
 
-    let viewer_token = issue_viewer_token(&state, payload.username.trim().to_string(), true, None, Some(ttl)).await;
+    let viewer_token = issue_viewer_token(
+        &state,
+        payload.username.trim().to_string(),
+        true,
+        None,
+        Some(ttl),
+    )
+    .await;
     let mut headers_out = HeaderMap::new();
-    append_cookie(&mut headers_out, build_cookie(ADMIN_COOKIE, &token, ttl.as_secs()));
-    append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &viewer_token, ttl.as_secs()));
+    append_cookie(
+        &mut headers_out,
+        build_cookie(ADMIN_COOKIE, &token, ttl.as_secs()),
+    );
+    append_cookie(
+        &mut headers_out,
+        build_cookie(VIEWER_COOKIE, &viewer_token, ttl.as_secs()),
+    );
     (
         StatusCode::OK,
         headers_out,
@@ -2788,7 +3003,7 @@ async fn admin_login(
             "expiresIn": ttl.as_secs(),
             "viewerToken": viewer_token,
             "viewerName": payload.username.trim()
-        }))
+        })),
     )
 }
 
@@ -2801,12 +3016,12 @@ async fn admin_access_mode(State(state): State<Arc<AppState>>) -> impl IntoRespo
     )
 }
 
-async fn admin_me(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn admin_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid" })),
+        );
     }
     (StatusCode::OK, Json(json!({ "ok": true })))
 }
@@ -2823,9 +3038,17 @@ async fn admin_turnstile_login(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if !check_cf_access(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "access" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            Json(json!({ "error": "access" })),
+        );
     }
-    (StatusCode::OK, HeaderMap::new(), Json(json!({ "ok": true })))
+    (
+        StatusCode::OK,
+        HeaderMap::new(),
+        Json(json!({ "ok": true })),
+    )
 }
 
 async fn admin_smtp_get(
@@ -2833,7 +3056,10 @@ async fn admin_smtp_get(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let data = state.smtp.read().await.clone().map(|cfg| SmtpPublic {
         host: cfg.host,
@@ -2844,7 +3070,10 @@ async fn admin_smtp_get(
         starttls: cfg.starttls,
         password_set: !cfg.password.is_empty(),
     });
-    (StatusCode::OK, Json(json!({ "configured": data.is_some(), "data": data })))
+    (
+        StatusCode::OK,
+        Json(json!({ "configured": data.is_some(), "data": data })),
+    )
 }
 
 async fn admin_smtp_set(
@@ -2853,7 +3082,10 @@ async fn admin_smtp_set(
     Json(payload): Json<SmtpConfig>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     if payload.host.trim().is_empty()
         || payload.username.trim().is_empty()
@@ -2882,7 +3114,10 @@ async fn admin_smtp_test(
     Json(payload): Json<SmtpTestPayload>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let to = payload.to.trim();
     if !is_valid_email(to) {
@@ -2890,7 +3125,10 @@ async fn admin_smtp_test(
     }
     let smtp = state.smtp.read().await.clone();
     let Some(smtp) = smtp else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "smtp_not_configured" })));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "smtp_not_configured" })),
+        );
     };
     if let Err(err) = send_email_code_with_subject(
         &smtp,
@@ -2901,7 +3139,10 @@ async fn admin_smtp_test(
     )
     .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": err })));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err })),
+        );
     }
     (StatusCode::OK, Json(json!({ "ok": true })))
 }
@@ -2911,7 +3152,10 @@ async fn admin_telegram_get(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let raw = get_json(&state.pool, "telegram_channel", json!("")).await;
     let channel = raw.as_str().unwrap_or("").to_string();
@@ -2920,7 +3164,13 @@ async fn admin_telegram_get(
         .as_ref()
         .map(|val| !val.trim().is_empty())
         .unwrap_or(false);
-    (StatusCode::OK, Json(json!(TelegramChannelPublic { channel, token_configured })))
+    (
+        StatusCode::OK,
+        Json(json!(TelegramChannelPublic {
+            channel,
+            token_configured
+        })),
+    )
 }
 
 async fn admin_telegram_set(
@@ -2929,7 +3179,10 @@ async fn admin_telegram_set(
     Json(payload): Json<TelegramChannelPayload>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let channel = payload.channel.trim().to_string();
     set_json(&state.pool, "telegram_channel", &json!(channel)).await;
@@ -2941,7 +3194,10 @@ async fn admin_notify_templates_get(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let data = get_json(&state.pool, "notify_templates", default_notify_templates()).await;
     (StatusCode::OK, Json(json!({ "data": data })))
@@ -2953,7 +3209,10 @@ async fn admin_notify_templates_set(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     if !payload.is_object() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid" })));
@@ -2967,9 +3226,13 @@ async fn admin_viewer_anti_abuse_get(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthorized" })),
+        );
     }
-    let cfg = resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
+    let cfg =
+        resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
     (
         StatusCode::OK,
         Json(json!(ViewerAntiAbusePublic::from(&cfg))),
@@ -2982,9 +3245,13 @@ async fn admin_viewer_anti_abuse_set(
     Json(payload): Json<ViewerAntiAbusePayload>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthorized" })),
+        );
     }
-    let mut cfg = resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
+    let mut cfg =
+        resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
 
     if let Some(value) = payload.verify_email_rate_limit_window_secs {
         cfg.verify_email_rate_limit_window_secs = value.clamp(60, 86400);
@@ -3023,9 +3290,13 @@ async fn viewer_register_token(
     Json(payload): Json<RegisterTokenPayload>,
 ) -> impl IntoResponse {
     if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "turnstile" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "turnstile" })),
+        );
     }
-    let anti_abuse = resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
+    let anti_abuse =
+        resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
     let now = now_ts();
     let ip = client_ip(&headers).unwrap_or_else(|| "unknown".to_string());
     let recent_count: i64 = sqlx::query_scalar(
@@ -3069,7 +3340,8 @@ async fn viewer_register_start(
     headers: HeaderMap,
     Json(payload): Json<RegisterStartPayload>,
 ) -> impl IntoResponse {
-    let anti_abuse = resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
+    let anti_abuse =
+        resolve_viewer_anti_abuse_config(&state.pool, &state.viewer_anti_abuse_defaults).await;
     let now = now_ts();
     let ip = client_ip(&headers).unwrap_or_else(|| "unknown".to_string());
     let register_token = payload
@@ -3189,7 +3461,10 @@ async fn viewer_register_start(
             .bind(now)
             .execute(&state.pool)
             .await;
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": err })));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err })),
+            );
         }
     } else if !state.email_echo {
         let _ = sqlx::query(
@@ -3199,17 +3474,18 @@ async fn viewer_register_start(
         .bind(now)
         .execute(&state.pool)
         .await;
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "smtp_not_configured" })));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "smtp_not_configured" })),
+        );
     }
 
-    let _ = sqlx::query(
-        "INSERT INTO viewer_email_log (email, ip, created_at) VALUES (?, ?, ?)",
-    )
-    .bind(&email)
-    .bind(&ip)
-    .bind(now)
-    .execute(&state.pool)
-    .await;
+    let _ = sqlx::query("INSERT INTO viewer_email_log (email, ip, created_at) VALUES (?, ?, ?)")
+        .bind(&email)
+        .bind(&ip)
+        .bind(now)
+        .execute(&state.pool)
+        .await;
 
     let mut response = json!({
         "ok": true,
@@ -3228,7 +3504,11 @@ async fn viewer_register_verify(
     Json(payload): Json<RegisterVerifyPayload>,
 ) -> impl IntoResponse {
     if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "turnstile" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            Json(json!({ "error": "turnstile" })),
+        );
     }
     let email = payload.email.trim().to_lowercase();
     let username = payload.username.trim();
@@ -3236,44 +3516,66 @@ async fn viewer_register_verify(
     let code = payload.code.trim();
 
     if !is_valid_email(&email) || username.is_empty() || password.len() < 6 || code.is_empty() {
-        return (StatusCode::BAD_REQUEST, HeaderMap::new(), Json(json!({ "error": "invalid" })));
+        return (
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            Json(json!({ "error": "invalid" })),
+        );
     }
     if is_reserved_username(&state, username).await {
-        return (StatusCode::CONFLICT, HeaderMap::new(), Json(json!({ "error": "username_reserved" })));
+        return (
+            StatusCode::CONFLICT,
+            HeaderMap::new(),
+            Json(json!({ "error": "username_reserved" })),
+        );
     }
 
     let mut pending = state.pending_viewer_codes.write().await;
     let Some(stored) = pending.get(&email) else {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "code" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            Json(json!({ "error": "code" })),
+        );
     };
     if stored.expires_at < Instant::now() || stored.code != code {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "code" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            Json(json!({ "error": "code" })),
+        );
     }
 
-    let email_exists: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM viewer_users WHERE LOWER(email) = LOWER(?)"
-    )
-    .bind(&email)
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
+    let email_exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM viewer_users WHERE LOWER(email) = LOWER(?)")
+            .bind(&email)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(0);
     if email_exists > 0 {
-        return (StatusCode::CONFLICT, HeaderMap::new(), Json(json!({ "error": "email_exists" })));
+        return (
+            StatusCode::CONFLICT,
+            HeaderMap::new(),
+            Json(json!({ "error": "email_exists" })),
+        );
     }
-    let name_exists: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM viewer_users WHERE LOWER(username) = LOWER(?)"
-    )
-    .bind(username)
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
+    let name_exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM viewer_users WHERE LOWER(username) = LOWER(?)")
+            .bind(username)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(0);
     if name_exists > 0 {
-        return (StatusCode::CONFLICT, HeaderMap::new(), Json(json!({ "error": "username_exists" })));
+        return (
+            StatusCode::CONFLICT,
+            HeaderMap::new(),
+            Json(json!({ "error": "username_exists" })),
+        );
     }
 
     let created_at = now_iso();
     let insert = sqlx::query(
-        "INSERT INTO viewer_users (username, email, password_hash, created_at) VALUES (?, ?, ?, ?)"
+        "INSERT INTO viewer_users (username, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
     )
     .bind(username)
     .bind(&email)
@@ -3286,11 +3588,16 @@ async fn viewer_register_verify(
 
     let token = issue_viewer_token(&state, username.to_string(), false, user_id, None).await;
     let mut headers_out = HeaderMap::new();
-    append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &token, state.viewer_token_ttl.as_secs()));
+    append_cookie(
+        &mut headers_out,
+        build_cookie(VIEWER_COOKIE, &token, state.viewer_token_ttl.as_secs()),
+    );
     (
         StatusCode::OK,
         headers_out,
-        Json(json!({ "ok": true, "token": token, "username": username, "expiresIn": state.viewer_token_ttl.as_secs() }))
+        Json(
+            json!({ "ok": true, "token": token, "username": username, "expiresIn": state.viewer_token_ttl.as_secs() }),
+        ),
     )
 }
 
@@ -3299,7 +3606,11 @@ async fn viewer_login(
     Json(payload): Json<LoginPayload>,
 ) -> impl IntoResponse {
     if !verify_turnstile(&state, payload.turnstile_token.clone()).await {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "turnstile" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            Json(json!({ "error": "turnstile" })),
+        );
     }
     let username = payload.username.trim();
     let password_hash = hash_password(payload.password.trim());
@@ -3312,30 +3623,42 @@ async fn viewer_login(
     .await
     .unwrap_or(None);
     let Some((user_id, db_username, db_hash)) = row else {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "invalid" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            Json(json!({ "error": "invalid" })),
+        );
     };
     if db_hash != password_hash {
-        return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(json!({ "error": "invalid" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            Json(json!({ "error": "invalid" })),
+        );
     }
 
     let ttl = ttl_from_remember(state.viewer_token_ttl, payload.remember_days);
-    let token = issue_viewer_token(&state, db_username.clone(), false, Some(user_id), Some(ttl)).await;
+    let token =
+        issue_viewer_token(&state, db_username.clone(), false, Some(user_id), Some(ttl)).await;
     let mut headers_out = HeaderMap::new();
-    append_cookie(&mut headers_out, build_cookie(VIEWER_COOKIE, &token, ttl.as_secs()));
+    append_cookie(
+        &mut headers_out,
+        build_cookie(VIEWER_COOKIE, &token, ttl.as_secs()),
+    );
     (
         StatusCode::OK,
         headers_out,
-        Json(json!({ "token": token, "username": db_username, "expiresIn": ttl.as_secs() }))
+        Json(json!({ "token": token, "username": db_username, "expiresIn": ttl.as_secs() })),
     )
 }
 
-async fn viewer_me(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn viewer_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     let username = viewer_from_header(&headers, &state).await;
     let Some(username) = username else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid" })),
+        );
     };
     (StatusCode::OK, Json(json!({ "username": username })))
 }
@@ -3352,11 +3675,14 @@ async fn viewer_profile_get(
 ) -> impl IntoResponse {
     let session = viewer_session_from_header(&headers, &state).await;
     let Some((_, username, user_id)) = session else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid" })),
+        );
     };
     let row = if let Some(uid) = user_id {
         sqlx::query_as::<_, (String, String)>(
-            "SELECT username, email FROM viewer_users WHERE id = ? LIMIT 1"
+            "SELECT username, email FROM viewer_users WHERE id = ? LIMIT 1",
         )
         .bind(uid)
         .fetch_optional(&state.pool)
@@ -3364,7 +3690,7 @@ async fn viewer_profile_get(
         .unwrap_or(None)
     } else {
         sqlx::query_as::<_, (String, String)>(
-            "SELECT username, email FROM viewer_users WHERE LOWER(username) = LOWER(?) LIMIT 1"
+            "SELECT username, email FROM viewer_users WHERE LOWER(username) = LOWER(?) LIMIT 1",
         )
         .bind(&username)
         .fetch_optional(&state.pool)
@@ -3374,7 +3700,13 @@ async fn viewer_profile_get(
     let Some((db_username, db_email)) = row else {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" })));
     };
-    (StatusCode::OK, Json(json!(ViewerProfile { username: db_username, email: db_email })))
+    (
+        StatusCode::OK,
+        Json(json!(ViewerProfile {
+            username: db_username,
+            email: db_email
+        })),
+    )
 }
 
 async fn viewer_profile_update(
@@ -3384,7 +3716,10 @@ async fn viewer_profile_update(
 ) -> impl IntoResponse {
     let session = viewer_session_from_header(&headers, &state).await;
     let Some((token, _username, user_id)) = session else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid" })),
+        );
     };
     let next_username = payload.username.trim();
     let next_email = payload.email.trim().to_lowercase();
@@ -3392,11 +3727,14 @@ async fn viewer_profile_update(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid" })));
     }
     if is_reserved_username(&state, next_username).await {
-        return (StatusCode::CONFLICT, Json(json!({ "error": "username_reserved" })));
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "username_reserved" })),
+        );
     }
     let uid = user_id.unwrap_or(0);
     let name_exists: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM viewer_users WHERE LOWER(username) = LOWER(?) AND id <> ?"
+        "SELECT COUNT(*) FROM viewer_users WHERE LOWER(username) = LOWER(?) AND id <> ?",
     )
     .bind(next_username)
     .bind(uid)
@@ -3404,10 +3742,13 @@ async fn viewer_profile_update(
     .await
     .unwrap_or(0);
     if name_exists > 0 {
-        return (StatusCode::CONFLICT, Json(json!({ "error": "username_exists" })));
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "username_exists" })),
+        );
     }
     let email_exists: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM viewer_users WHERE LOWER(email) = LOWER(?) AND id <> ?"
+        "SELECT COUNT(*) FROM viewer_users WHERE LOWER(email) = LOWER(?) AND id <> ?",
     )
     .bind(&next_email)
     .bind(uid)
@@ -3415,19 +3756,23 @@ async fn viewer_profile_update(
     .await
     .unwrap_or(0);
     if email_exists > 0 {
-        return (StatusCode::CONFLICT, Json(json!({ "error": "email_exists" })));
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "email_exists" })),
+        );
     }
 
-    let update = sqlx::query(
-        "UPDATE viewer_users SET username = ?, email = ? WHERE id = ?"
-    )
-    .bind(next_username)
-    .bind(&next_email)
-    .bind(uid)
-    .execute(&state.pool)
-    .await;
+    let update = sqlx::query("UPDATE viewer_users SET username = ?, email = ? WHERE id = ?")
+        .bind(next_username)
+        .bind(&next_email)
+        .bind(uid)
+        .execute(&state.pool)
+        .await;
     if update.is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "db" })));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "db" })),
+        );
     }
 
     let mut tokens = state.viewer_tokens.write().await;
@@ -3435,7 +3780,13 @@ async fn viewer_profile_update(
         session.username = next_username.to_string();
     }
 
-    (StatusCode::OK, Json(json!(ViewerProfile { username: next_username.to_string(), email: next_email })))
+    (
+        StatusCode::OK,
+        Json(json!(ViewerProfile {
+            username: next_username.to_string(),
+            email: next_email
+        })),
+    )
 }
 
 async fn admin_stream_update(
@@ -3444,7 +3795,10 @@ async fn admin_stream_update(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let mut base = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
     merge_object(&mut base, &payload);
@@ -3462,7 +3816,10 @@ async fn admin_stats_replace(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let items = unwrap_items(&payload);
     set_json(&state.pool, "stats", &items).await;
@@ -3476,7 +3833,10 @@ async fn admin_health_replace(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let items = unwrap_items(&payload);
     set_json(&state.pool, "health", &items).await;
@@ -3490,7 +3850,10 @@ async fn admin_schedule_replace(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let items = unwrap_items(&payload);
     set_json(&state.pool, "schedule", &items).await;
@@ -3505,7 +3868,10 @@ async fn admin_channels_replace(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let items = unwrap_items(&payload);
     set_json(&state.pool, "channels", &items).await;
@@ -3519,7 +3885,10 @@ async fn admin_ops_replace(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let items = unwrap_items(&payload);
     set_json(&state.pool, "ops_alerts", &items).await;
@@ -3533,7 +3902,10 @@ async fn admin_nodes_replace(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let items = unwrap_items(&payload);
     set_json(&state.pool, "nodes", &items).await;
@@ -3547,7 +3919,10 @@ async fn admin_ingest_replace(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let items = unwrap_items(&payload);
     set_json(&state.pool, "ingest_config", &items).await;
@@ -3561,7 +3936,10 @@ async fn report_ingest(
     Json(payload): Json<StreamUpdate>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
 
     let mut current = get_json(&state.pool, "stream", default_kv()[0].1.clone()).await;
@@ -3591,7 +3969,10 @@ async fn admin_room_create(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
 
     let room_id = format!("{}", chrono::Utc::now().timestamp());
@@ -3609,12 +3990,20 @@ async fn admin_room_create(
     let public_host = resolve_public_host(&state).await;
     let srt_url = format!(
         "srt://{}:8890?streamid=publish:{}:token:{}",
-        public_host,
-        state.mediamtx_path,
-        key
+        public_host, state.mediamtx_path, key
     );
-    let rtmp_url = build_push_url(&state.mediamtx_rtmp, &public_host, &state.mediamtx_path, &key);
-    let rtsp_url = build_push_url(&state.mediamtx_rtsp, &public_host, &state.mediamtx_path, &key);
+    let rtmp_url = build_push_url(
+        &state.mediamtx_rtmp,
+        &public_host,
+        &state.mediamtx_path,
+        &key,
+    );
+    let rtsp_url = build_push_url(
+        &state.mediamtx_rtsp,
+        &public_host,
+        &state.mediamtx_path,
+        &key,
+    );
 
     let ingest = json!([
         {
@@ -3652,7 +4041,12 @@ async fn admin_room_create(
     broadcast(&state, "ingest:update", &ingest);
 
     let read = ensure_read_token(&state).await;
-    (StatusCode::OK, Json(json!({ "ok": true, "roomId": room_id, "key": key, "srtUrl": srt_url, "rtmpUrl": rtmp_url, "rtspUrl": rtsp_url, "readToken": read })))
+    (
+        StatusCode::OK,
+        Json(
+            json!({ "ok": true, "roomId": room_id, "key": key, "srtUrl": srt_url, "rtmpUrl": rtmp_url, "rtspUrl": rtsp_url, "readToken": read }),
+        ),
+    )
 }
 
 async fn admin_ingest_refresh(
@@ -3660,7 +4054,10 @@ async fn admin_ingest_refresh(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
 
     let next = generate_key();
@@ -3673,20 +4070,30 @@ async fn admin_ingest_refresh(
     let public_host = resolve_public_host(&state).await;
     let srt_url = format!(
         "srt://{}:8890?streamid=publish:{}:token:{}",
-        public_host,
-        state.mediamtx_path,
-        next
+        public_host, state.mediamtx_path, next
     );
-    let rtmp_url = build_push_url(&state.mediamtx_rtmp, &public_host, &state.mediamtx_path, &next);
-    let rtsp_url = build_push_url(&state.mediamtx_rtsp, &public_host, &state.mediamtx_path, &next);
+    let rtmp_url = build_push_url(
+        &state.mediamtx_rtmp,
+        &public_host,
+        &state.mediamtx_path,
+        &next,
+    );
+    let rtsp_url = build_push_url(
+        &state.mediamtx_rtsp,
+        &public_host,
+        &state.mediamtx_path,
+        &next,
+    );
 
-    (StatusCode::OK, Json(json!({ "ok": true, "srt": srt_url, "rtmp": rtmp_url, "rtsp": rtsp_url, "token": next })))
+    (
+        StatusCode::OK,
+        Json(
+            json!({ "ok": true, "srt": srt_url, "rtmp": rtmp_url, "rtsp": rtsp_url, "token": next }),
+        ),
+    )
 }
 
-async fn ws_handler(
-    State(state): State<Arc<AppState>>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+async fn ws_handler(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_ws(socket, state))
 }
 
@@ -3782,7 +4189,9 @@ fn broadcast(state: &AppState, event: &str, data: &Value) {
 }
 
 async fn check_bearer(headers: &HeaderMap, state: &AppState) -> bool {
-    let Some(token) = token_from_headers(headers, ADMIN_COOKIE) else { return false };
+    let Some(token) = token_from_headers(headers, ADMIN_COOKIE) else {
+        return false;
+    };
 
     let mut tokens = state.tokens.write().await;
     let now = Instant::now();
@@ -3808,7 +4217,9 @@ fn check_cf_access(headers: &HeaderMap, state: &AppState) -> bool {
 }
 
 async fn viewer_from_header(headers: &HeaderMap, state: &AppState) -> Option<String> {
-    let Some(token) = token_from_headers(headers, VIEWER_COOKIE) else { return None };
+    let Some(token) = token_from_headers(headers, VIEWER_COOKIE) else {
+        return None;
+    };
 
     let mut tokens = state.viewer_tokens.write().await;
     let now = Instant::now();
@@ -3822,8 +4233,13 @@ async fn viewer_from_header(headers: &HeaderMap, state: &AppState) -> Option<Str
     })
 }
 
-async fn viewer_session_from_header(headers: &HeaderMap, state: &AppState) -> Option<(String, String, Option<i64>)> {
-    let Some(token) = token_from_headers(headers, VIEWER_COOKIE) else { return None };
+async fn viewer_session_from_header(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Option<(String, String, Option<i64>)> {
+    let Some(token) = token_from_headers(headers, VIEWER_COOKIE) else {
+        return None;
+    };
 
     let mut tokens = state.viewer_tokens.write().await;
     let now = Instant::now();
@@ -3831,7 +4247,7 @@ async fn viewer_session_from_header(headers: &HeaderMap, state: &AppState) -> Op
     if let Some(session) = tokens.get_mut(&token) {
         if session.user_id.is_none() && !session.is_host {
             let user_id = sqlx::query_scalar::<_, i64>(
-                "SELECT id FROM viewer_users WHERE LOWER(username) = LOWER(?) LIMIT 1"
+                "SELECT id FROM viewer_users WHERE LOWER(username) = LOWER(?) LIMIT 1",
             )
             .bind(&session.username)
             .fetch_optional(&state.pool)
@@ -3871,7 +4287,6 @@ async fn get_admin_accounts(pool: &MySqlPool) -> Vec<AdminAccount> {
     serde_json::from_value(raw).unwrap_or_default()
 }
 
-
 async fn get_viewer_accounts(pool: &MySqlPool) -> Vec<ViewerAccount> {
     let rows = sqlx::query_as::<_, (i64, String, String, String, String)>(
         r#"
@@ -3884,15 +4299,16 @@ async fn get_viewer_accounts(pool: &MySqlPool) -> Vec<ViewerAccount> {
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    rows
-        .into_iter()
-        .map(|(id, username, email, password_hash, created_at)| ViewerAccount {
-            id: Some(id),
-            username,
-            email,
-            password_hash,
-            created_at,
-        })
+    rows.into_iter()
+        .map(
+            |(id, username, email, password_hash, created_at)| ViewerAccount {
+                id: Some(id),
+                username,
+                email,
+                password_hash,
+                created_at,
+            },
+        )
         .collect()
 }
 
@@ -3946,12 +4362,18 @@ async fn cleanup_duplicate_viewers(state: &AppState) {
         return;
     }
     let reserved = reserved_usernames(state).await;
-    let mut used: HashSet<String> = accounts.iter().map(|acc| normalize_username(&acc.username)).collect();
+    let mut used: HashSet<String> = accounts
+        .iter()
+        .map(|acc| normalize_username(&acc.username))
+        .collect();
     let mut renamed: Vec<(i64, String, String, String)> = Vec::new();
 
     let mut grouped: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, acc) in accounts.iter().enumerate() {
-        grouped.entry(normalize_username(&acc.username)).or_default().push(idx);
+        grouped
+            .entry(normalize_username(&acc.username))
+            .or_default()
+            .push(idx);
     }
 
     for (name, mut indices) in grouped {
@@ -3965,7 +4387,9 @@ async fn cleanup_duplicate_viewers(state: &AppState) {
                 loop {
                     let suffix = rand_u64() % 10000;
                     next = format!("meow_{:04}", suffix);
-                    if !used.contains(&normalize_username(&next)) && !reserved.contains(&normalize_username(&next)) {
+                    if !used.contains(&normalize_username(&next))
+                        && !reserved.contains(&normalize_username(&next))
+                    {
                         break;
                     }
                 }
@@ -4101,7 +4525,9 @@ fn load_smtp_config() -> Option<SmtpConfig> {
     let username = std::env::var("SMTP_USER").ok()?;
     let password = std::env::var("SMTP_PASS").ok()?;
     let from = std::env::var("SMTP_FROM").ok()?;
-    let reply_to = std::env::var("SMTP_REPLY_TO").ok().filter(|v| !v.trim().is_empty());
+    let reply_to = std::env::var("SMTP_REPLY_TO")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let starttls = std::env::var("SMTP_STARTTLS")
         .map(|val| val.to_lowercase() != "false")
         .unwrap_or(true);
@@ -4254,7 +4680,10 @@ async fn update_stream_patch(state: &AppState, patch: &Value) {
 }
 
 async fn record_stream_stats_if_due(state: &AppState, stream: &Value) {
-    let status = stream.get("status").and_then(|v| v.as_str()).unwrap_or("offline");
+    let status = stream
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("offline");
     if status != "live" && status != "ready" {
         return;
     }
@@ -4279,7 +4708,8 @@ async fn record_stream_stats_if_due(state: &AppState, stream: &Value) {
         .get("fpsValue")
         .and_then(|v| v.as_i64())
         .or_else(|| {
-            stream.get("fps")
+            stream
+                .get("fps")
                 .and_then(|v| v.as_str())
                 .and_then(parse_number)
                 .map(|v| v.round() as i64)
@@ -4322,10 +4752,17 @@ fn set_opt(obj: &mut serde_json::Map<String, Value>, key: &str, value: Option<St
 }
 
 fn get_template_value<'a>(templates: &'a Value, kind: &str) -> Option<&'a Value> {
-    templates.get(kind).and_then(|val| val.as_object()).map(|_| templates.get(kind).unwrap())
+    templates
+        .get(kind)
+        .and_then(|val| val.as_object())
+        .map(|_| templates.get(kind).unwrap())
 }
 
-fn render_template(template: &str, ctx: &HashMap<String, String>, captures: Option<&regex::Captures>) -> String {
+fn render_template(
+    template: &str,
+    ctx: &HashMap<String, String>,
+    captures: Option<&regex::Captures>,
+) -> String {
     let mut out = template.to_string();
     for (key, value) in ctx {
         out = out.replace(&format!("{{{key}}}"), value);
@@ -4354,7 +4791,10 @@ fn resolve_notify_template(
             if rule_kind != kind {
                 continue;
             }
-            let field = rule.get("field").and_then(|v| v.as_str()).unwrap_or("title");
+            let field = rule
+                .get("field")
+                .and_then(|v| v.as_str())
+                .unwrap_or("title");
             let pattern = rule.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             let target = ctx.get(field).cloned().unwrap_or_default();
             if pattern.is_empty() {
@@ -4362,9 +4802,18 @@ fn resolve_notify_template(
             }
             if let Ok(re) = regex::Regex::new(pattern) {
                 if let Some(caps) = re.captures(&target) {
-                    let title_tpl = rule.get("title").and_then(|v| v.as_str()).unwrap_or(fallback_title);
-                    let msg_tpl = rule.get("message").and_then(|v| v.as_str()).unwrap_or(fallback_message);
-                    let url_tpl = rule.get("url").and_then(|v| v.as_str()).unwrap_or(fallback_url);
+                    let title_tpl = rule
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(fallback_title);
+                    let msg_tpl = rule
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(fallback_message);
+                    let url_tpl = rule
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(fallback_url);
                     return (
                         render_template(title_tpl, ctx, Some(&caps)),
                         render_template(msg_tpl, ctx, Some(&caps)),
@@ -4375,9 +4824,18 @@ fn resolve_notify_template(
         }
     }
     let tpl = get_template_value(templates, kind);
-    let title_tpl = tpl.and_then(|v| v.get("title")).and_then(|v| v.as_str()).unwrap_or(fallback_title);
-    let msg_tpl = tpl.and_then(|v| v.get("message")).and_then(|v| v.as_str()).unwrap_or(fallback_message);
-    let url_tpl = tpl.and_then(|v| v.get("url")).and_then(|v| v.as_str()).unwrap_or(fallback_url);
+    let title_tpl = tpl
+        .and_then(|v| v.get("title"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback_title);
+    let msg_tpl = tpl
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback_message);
+    let url_tpl = tpl
+        .and_then(|v| v.get("url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback_url);
     (
         render_template(title_tpl, ctx, None),
         render_template(msg_tpl, ctx, None),
@@ -4424,7 +4882,9 @@ fn token_from_headers(headers: &HeaderMap, cookie_name: &str) -> Option<String> 
     let cookie_header = headers.get("cookie").and_then(|val| val.to_str().ok())?;
     for part in cookie_header.split(';') {
         let trimmed = part.trim();
-        let Some((name, value)) = trimmed.split_once('=') else { continue };
+        let Some((name, value)) = trimmed.split_once('=') else {
+            continue;
+        };
         if name == cookie_name {
             let value = value.trim();
             if !value.is_empty() {
@@ -4532,17 +4992,19 @@ async fn push_notification(state: &AppState, kind: &str, title: &str, message: &
     ctx.insert("scheduleTime".to_string(), schedule_time.to_string());
     ctx.insert("scheduleTitle".to_string(), schedule_title.to_string());
     ctx.insert("scheduleHost".to_string(), schedule_host.to_string());
-    let (title, message, url) = resolve_notify_template(
-        &templates,
-        kind,
-        &ctx,
-        title,
-        message,
-        "",
-    );
+    let (title, message, url) = resolve_notify_template(&templates, kind, &ctx, title, message, "");
     let mut final_message = message;
-    let final_url = if !url.is_empty() { url } else if kind == "live" { live_url } else { String::new() };
-    if !final_url.is_empty() && !final_message.contains(&final_url) && !final_message.contains("{liveUrl}") {
+    let final_url = if !url.is_empty() {
+        url
+    } else if kind == "live" {
+        live_url
+    } else {
+        String::new()
+    };
+    if !final_url.is_empty()
+        && !final_message.contains(&final_url)
+        && !final_message.contains("{liveUrl}")
+    {
         final_message = format!("{final_message}\n\n观看地址：{final_url}");
     }
     list.push(json!({
@@ -4577,9 +5039,13 @@ async fn push_notification(state: &AppState, kind: &str, title: &str, message: &
         if let Some(map) = subs_map.as_object() {
             for (username, cfg) in map {
                 let live = cfg.get("live").and_then(|v| v.as_bool()).unwrap_or(false);
-                let schedule = cfg.get("schedule").and_then(|v| v.as_bool()).unwrap_or(false);
+                let schedule = cfg
+                    .get("schedule")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let email = cfg.get("email").and_then(|v| v.as_bool()).unwrap_or(false);
-                let ok = (kind == "live" || kind == "offline") && live || kind == "schedule" && schedule;
+                let ok =
+                    (kind == "live" || kind == "offline") && live || kind == "schedule" && schedule;
                 if ok {
                     recipients.push((username.clone(), email));
                 }
@@ -4596,7 +5062,10 @@ async fn push_notification(state: &AppState, kind: &str, title: &str, message: &
             if !*want_email {
                 continue;
             }
-            if let Some(acc) = accounts.iter().find(|acc| acc.username.eq_ignore_ascii_case(username)) {
+            if let Some(acc) = accounts
+                .iter()
+                .find(|acc| acc.username.eq_ignore_ascii_case(username))
+            {
                 email_targets.push(acc.email.clone());
             }
         }
@@ -4628,12 +5097,18 @@ async fn admin_notification_push(
     Json(payload): Json<AdminNotificationPayload>,
 ) -> impl IntoResponse {
     if !check_admin_auth(&headers, &state).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API key" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid API key" })),
+        );
     }
     let title = payload.title.trim();
     let message = payload.message.trim();
     if title.is_empty() || message.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "missing_fields" })));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing_fields" })),
+        );
     }
     let kind = payload.kind.unwrap_or_else(|| "announcement".to_string());
     let url = payload.url.unwrap_or_default();
@@ -4669,18 +5144,24 @@ async fn viewer_subscription_get(
 ) -> impl IntoResponse {
     let session = viewer_session_from_header(&headers, &state).await;
     let Some((_token, username, _)) = session else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid" })),
+        );
     };
     let map = get_json(&state.pool, "viewer_subscriptions", json!({})).await;
     let entry = map
         .get(&username)
         .cloned()
         .unwrap_or_else(|| json!({ "live": false, "schedule": false, "email": false }));
-    (StatusCode::OK, Json(json!({
-        "live": entry.get("live").and_then(|v| v.as_bool()).unwrap_or(false),
-        "schedule": entry.get("schedule").and_then(|v| v.as_bool()).unwrap_or(false),
-        "email": entry.get("email").and_then(|v| v.as_bool()).unwrap_or(false)
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "live": entry.get("live").and_then(|v| v.as_bool()).unwrap_or(false),
+            "schedule": entry.get("schedule").and_then(|v| v.as_bool()).unwrap_or(false),
+            "email": entry.get("email").and_then(|v| v.as_bool()).unwrap_or(false)
+        })),
+    )
 }
 
 async fn viewer_subscription_set(
@@ -4690,7 +5171,10 @@ async fn viewer_subscription_set(
 ) -> impl IntoResponse {
     let session = viewer_session_from_header(&headers, &state).await;
     let Some((_token, username, _)) = session else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid" })),
+        );
     };
     let mut map = get_json(&state.pool, "viewer_subscriptions", json!({})).await;
     if !map.is_object() {
@@ -4700,10 +5184,16 @@ async fn viewer_subscription_set(
     let schedule = payload.schedule.unwrap_or(false);
     let email = payload.email.unwrap_or(false);
     if let Some(obj) = map.as_object_mut() {
-        obj.insert(username.clone(), json!({ "live": live, "schedule": schedule, "email": email }));
+        obj.insert(
+            username.clone(),
+            json!({ "live": live, "schedule": schedule, "email": email }),
+        );
     }
     set_json(&state.pool, "viewer_subscriptions", &map).await;
-    (StatusCode::OK, Json(json!({ "ok": true, "live": live, "schedule": schedule, "email": email })))
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "live": live, "schedule": schedule, "email": email })),
+    )
 }
 
 async fn verify_turnstile(state: &AppState, token: Option<String>) -> bool {
@@ -4721,8 +5211,13 @@ async fn verify_turnstile(state: &AppState, token: Option<String>) -> bool {
         .await;
 
     let Ok(res) = res else { return false };
-    let Ok(payload) = res.json::<Value>().await else { return false };
-    payload.get("success").and_then(|v| v.as_bool()).unwrap_or(false)
+    let Ok(payload) = res.json::<Value>().await else {
+        return false;
+    };
+    payload
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 async fn run_srt_listener(
@@ -4753,7 +5248,9 @@ async fn handle_srt_session(
     forward: Option<String>,
 ) -> Result<(), String> {
     state.active_streams.fetch_add(1, Ordering::SeqCst);
-    let _guard = StreamGuard { state: state.clone() };
+    let _guard = StreamGuard {
+        state: state.clone(),
+    };
     update_stream_status(&state, "live").await;
 
     let mut outbound = if let Some(target) = forward {

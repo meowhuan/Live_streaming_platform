@@ -8,6 +8,7 @@
 - 管理端（`/admin.html`）用于推流配置、链路监控、SMTP 等管理操作。
 - MediaMTX 鉴权代理（推流/播放 Token）。
 - 内置 SRT 监听/转发，方便本地推流测试。
+- Rust 服务端支持 Linux、Windows、macOS 构建与发行。
 - 观众账号系统 + 邮箱验证码。
 - Turnstile 人机验证。
 - 观众邮箱防盗刷（一次性注册令牌 + 频率限制）。
@@ -36,17 +37,18 @@ npm run dev
 
 ## 后端部署（生产）
 
-以下步骤以 Linux 服务器为例：
+服务端可在 Linux、Windows、macOS 上运行。以下为通用部署流程，平台细节见 [`docs/server-platforms.md`](docs/server-platforms.md)。
 
 1. 安装依赖：
-   - Rust（stable）
+   - Rust（stable，源码构建时需要）
    - MySQL
    - MediaMTX
+   - FFmpeg（使用直播封面或剪辑功能时需要）
 2. 创建数据库：
    - 数据库名：`live_streaming`
 3. 配置环境变量：
    - 复制 `.env.example` → `.env`
-   - 根据实际域名/端口修改（重点：`PORT`、`MEDIAMTX_*`、`TURNSTILE_SECRET`）
+   - 根据实际域名/端口修改（重点：`PORT`、`BIND_HOST`、`MEDIAMTX_*`、`TURNSTILE_SECRET`）
 4. 构建后端：
 
 ```bash
@@ -57,7 +59,13 @@ cargo build --release
 5. 启动（示例）：
 
 ```bash
-./server-rust/target/release/server-rust
+./target/release/server-rust
+```
+
+Windows PowerShell：
+
+```powershell
+.\target\release\server-rust.exe
 ```
 
 6. 反向代理（可选，但推荐）：
@@ -73,6 +81,8 @@ cargo build --release
    - MediaMTX WHEP：`8889`
    - MediaMTX HLS：`8888`
    - MediaMTX SRT：`8890`
+
+相对路径（如 `CLIP_DIR`、`LIVE_DIR`）均相对于服务端进程的工作目录。作为系统服务运行时建议使用绝对路径。
 
 如需 systemd 启动服务，可将 `server-rust` 可执行文件放入固定路径，并在 service 中读取 `.env`。
 
@@ -154,7 +164,7 @@ sudo systemctl status mediamtx
 
 - `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE`
 - `ADMIN_USER`, `ADMIN_PASS`
-- `PORT`（默认 `5174`）
+- `PORT`（默认 `5174`）, `BIND_HOST`（默认 `0.0.0.0`）
 - `WS_PATH`（默认 `/ws`）
 - `TOKEN_TTL_HOURS`
 - `ADMIN_TOKEN_MIN`, `ADMIN_REFRESH_DAYS`（管理端刷新令牌有效期，分钟/天）
@@ -176,11 +186,11 @@ sudo systemctl status mediamtx
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_REPLY_TO`, `SMTP_STARTTLS`
 - `MEDIAMTX_API`, `MEDIAMTX_METRICS`, `MEDIAMTX_WEBRTC`, `MEDIAMTX_HLS`, `MEDIAMTX_PATH`, `MEDIAMTX_POLL_MS`
 - `HLS_SEGMENT_DURATION_SECS`, `HLS_SEGMENT_COUNT`, `REPLAY_MAX_SECONDS`
-- `CLIP_MIN_SECS`, `CLIP_MAX_SECS`, `CLIP_TTL_SECS`, `CLIP_DIR`, `FFMPEG_BIN`
-- `THUMBNAIL_INTERVAL_SECS`, `THUMBNAIL_SOURCE`
+- `CLIP_MIN_SECS`, `CLIP_MAX_SECS`, `CLIP_TTL_SECS`, `CLIP_DIR`, `CLIP_TMP_DIR`, `LIVE_DIR`, `FFMPEG_BIN`
+- `THUMBNAIL_ENABLED`, `THUMBNAIL_INTERVAL_SECS`, `THUMBNAIL_SOURCE`
 - `CORS_ALLOWED_ORIGINS`（跨域携带 Cookie 的允许域）
 - `COOKIE_SAMESITE`, `COOKIE_SECURE`
-- `SRT_LISTEN`, `SRT_FORWARD`
+- `SRT_ENABLED`, `SRT_LISTEN`, `SRT_FORWARD`
 
 ### 前端（Vite）
 
@@ -254,7 +264,8 @@ MediaMTX 指向：
 
 ## SRT 中继
 
-后端监听 `SRT_LISTEN`（默认 `0.0.0.0:9000`）
+后端在 `SRT_ENABLED=true` 时监听 `SRT_LISTEN`（默认 `0.0.0.0:9000`）。
+如果只使用 MediaMTX 自带的 SRT/RTMP/RTSP 推流，可设置 `SRT_ENABLED=false`。
 可选转发：
 
 ```
@@ -308,6 +319,15 @@ Cloudflare Pages **不会读取** 仓库里的 `.env`。请在：
 
 配置 `VITE_*` 前缀变量。
 
+## CI 与发行
+
+- `CI` 工作流会构建前端，并在 Linux、Windows、macOS 上对 Rust 服务端运行格式检查、Clippy 和测试。
+- `Release Server` 工作流会在推送 `v*` tag 时发布服务端发行包，也支持手动输入 tag 触发。
+- 发行产物包含 `.env.example`、服务端二进制、运行目录和平台文档：
+  - `meow-live-server-linux-x64.tar.gz`
+  - `meow-live-server-windows-x64.zip`
+  - `meow-live-server-macos-universal.tar.gz`
+
 ## 许可
 
 MIT
@@ -324,6 +344,7 @@ A full-stack live streaming platform with a Rust backend, MediaMTX integration, 
 - Admin console (`/admin.html`) for stream config, ingest data, metrics, and SMTP settings.
 - MediaMTX auth proxy for publish/read tokens.
 - Built-in SRT listener/relay for ingest testing.
+- Rust backend builds and ships for Linux, Windows, and macOS.
 - Viewer accounts with email verification.
 - Turnstile verification for admin + viewer auth.
 - Viewer email anti-abuse (one-time register token + rate limits).
@@ -352,17 +373,18 @@ npm run dev
 
 ## Backend Deployment (Production)
 
-Example for Linux servers:
+The backend runs on Linux, Windows, and macOS. Platform-specific notes are in [`docs/server-platforms.md`](docs/server-platforms.md).
 
 1. Install dependencies:
-   - Rust (stable)
+   - Rust (stable, only when building from source)
    - MySQL
    - MediaMTX
+   - FFmpeg (only when thumbnails or clip creation are enabled)
 2. Create database:
    - name: `live_streaming`
 3. Configure environment:
    - copy `.env.example` → `.env`
-   - update `PORT`, `MEDIAMTX_*`, `TURNSTILE_SECRET`
+   - update `PORT`, `BIND_HOST`, `MEDIAMTX_*`, `TURNSTILE_SECRET`
 4. Build backend:
 
 ```bash
@@ -373,7 +395,13 @@ cargo build --release
 5. Run:
 
 ```bash
-./server-rust/target/release/server-rust
+./target/release/server-rust
+```
+
+Windows PowerShell:
+
+```powershell
+.\target\release\server-rust.exe
 ```
 
 6. Reverse proxy (recommended):
@@ -389,6 +417,8 @@ cargo build --release
    - MediaMTX WHEP: `8889`
    - MediaMTX HLS: `8888`
    - MediaMTX SRT: `8890`
+
+Relative paths such as `CLIP_DIR` and `LIVE_DIR` are resolved from the backend process working directory. Prefer absolute paths for service-managed deployments.
 
 If you use systemd, place the binary in a fixed path and load `.env` in the service unit.
 
@@ -470,7 +500,7 @@ sudo systemctl status mediamtx
 
 - `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE`
 - `ADMIN_USER`, `ADMIN_PASS`
-- `PORT` (default `5174`)
+- `PORT` (default `5174`), `BIND_HOST` (default `0.0.0.0`)
 - `WS_PATH` (default `/ws`)
 - `TOKEN_TTL_HOURS`
 - `ADMIN_TOKEN_MIN`, `ADMIN_REFRESH_DAYS`
@@ -489,10 +519,10 @@ sudo systemctl status mediamtx
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_REPLY_TO`, `SMTP_STARTTLS`
 - `MEDIAMTX_API`, `MEDIAMTX_METRICS`, `MEDIAMTX_WEBRTC`, `MEDIAMTX_HLS`, `MEDIAMTX_PATH`, `MEDIAMTX_POLL_MS`
 - `HLS_SEGMENT_DURATION_SECS`, `HLS_SEGMENT_COUNT`, `REPLAY_MAX_SECONDS`
-- `CLIP_MIN_SECS`, `CLIP_MAX_SECS`, `CLIP_TTL_SECS`, `CLIP_DIR`, `FFMPEG_BIN`
-- `THUMBNAIL_INTERVAL_SECS`, `THUMBNAIL_SOURCE`
+- `CLIP_MIN_SECS`, `CLIP_MAX_SECS`, `CLIP_TTL_SECS`, `CLIP_DIR`, `CLIP_TMP_DIR`, `LIVE_DIR`, `FFMPEG_BIN`
+- `THUMBNAIL_ENABLED`, `THUMBNAIL_INTERVAL_SECS`, `THUMBNAIL_SOURCE`
 - `CORS_ALLOWED_ORIGINS`, `COOKIE_SAMESITE`, `COOKIE_SECURE`
-- `SRT_LISTEN`, `SRT_FORWARD`
+- `SRT_ENABLED`, `SRT_LISTEN`, `SRT_FORWARD`
 
 ### Frontend (Vite)
 
@@ -566,7 +596,8 @@ The backend validates `token` for publish/read actions.
 
 ## SRT Relay
 
-The Rust backend listens on `SRT_LISTEN` (default `0.0.0.0:9000`).
+The Rust backend listens on `SRT_LISTEN` (default `0.0.0.0:9000`) when `SRT_ENABLED=true`.
+Set `SRT_ENABLED=false` if you only use MediaMTX ingest.
 Optional forward target:
 
 ```
@@ -608,6 +639,15 @@ Cloudflare Pages **does not** read `.env` from the repo. Set Vite variables in:
 `Settings → Environment variables`
 
 Use `VITE_*` prefixed vars only.
+
+## CI and Releases
+
+- `CI` builds the frontend and runs Rust formatting, Clippy, and tests on Linux, Windows, and macOS.
+- `Release Server` publishes backend packages when a `v*` tag is pushed, and also supports manual dispatch with a tag.
+- Release assets include `.env.example`, the server binary, runtime directories, and platform docs:
+  - `meow-live-server-linux-x64.tar.gz`
+  - `meow-live-server-windows-x64.zip`
+  - `meow-live-server-macos-universal.tar.gz`
 
 ## License
 

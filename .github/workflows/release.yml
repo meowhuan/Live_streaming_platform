@@ -1,0 +1,138 @@
+name: Release Server
+
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to create or update, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+            asset_name: meow-live-server-linux-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
+            asset_name: meow-live-server-windows-x64
+          - os: macos-latest
+            target: universal-apple-darwin
+            rust_targets: x86_64-apple-darwin aarch64-apple-darwin
+            asset_name: meow-live-server-macos-universal
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.rust_targets }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server-rust -> target
+
+      - name: Build server
+        if: runner.os != 'Windows' && matrix.target != 'universal-apple-darwin'
+        working-directory: server-rust
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build Windows server
+        if: runner.os == 'Windows'
+        working-directory: server-rust
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build universal macOS server
+        if: matrix.target == 'universal-apple-darwin'
+        working-directory: server-rust
+        run: |
+          cargo build --locked --release --target x86_64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          mkdir -p ../dist
+          lipo -create \
+            target/x86_64-apple-darwin/release/server-rust \
+            target/aarch64-apple-darwin/release/server-rust \
+            -output ../dist/server-rust-universal
+
+      - name: Package Unix server
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ASSET_NAME: ${{ matrix.asset_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          pkg="dist/${ASSET_NAME}"
+          mkdir -p "${pkg}/public/clips" "${pkg}/public/live" "${pkg}/docs"
+          if [ "${TARGET}" = "universal-apple-darwin" ]; then
+            cp "dist/server-rust-universal" "${pkg}/server-rust"
+          else
+            cp "server-rust/target/${TARGET}/release/server-rust" "${pkg}/server-rust"
+          fi
+          chmod +x "${pkg}/server-rust"
+          cp ".env.example" "${pkg}/.env.example"
+          cp "README.md" "${pkg}/README.md"
+          cp "LICENSE" "${pkg}/LICENSE"
+          cp "docs/server-platforms.md" "${pkg}/docs/server-platforms.md"
+          tar -czf "dist/${ASSET_NAME}.tar.gz" -C dist "${ASSET_NAME}"
+
+      - name: Package Windows server
+        if: runner.os == 'Windows'
+        env:
+          ASSET_NAME: ${{ matrix.asset_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $pkg = Join-Path "dist" $env:ASSET_NAME
+          New-Item -ItemType Directory -Force -Path "$pkg\public\clips", "$pkg\public\live", "$pkg\docs"
+          Copy-Item "server-rust\target\$env:TARGET\release\server-rust.exe" "$pkg\server-rust.exe"
+          Copy-Item ".env.example" "$pkg\.env.example"
+          Copy-Item "README.md" "$pkg\README.md"
+          Copy-Item "LICENSE" "$pkg\LICENSE"
+          Copy-Item "docs\server-platforms.md" "$pkg\docs\server-platforms.md"
+          Compress-Archive -Path $pkg -DestinationPath "dist\$env:ASSET_NAME.zip" -Force
+
+      - name: Upload server package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            dist/${{ matrix.asset_name }}.tar.gz
+            dist/${{ matrix.asset_name }}.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: Server ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/*
